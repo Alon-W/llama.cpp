@@ -645,110 +645,35 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         ggml_tensor * raw_k    = inp_attn->mctx->get_k(ctx0, il);
         ggml_tensor * raw_mask = inp_attn->self_attn_mask.raw;
 
-        const int32_t topk_src = hparams.dsv41_topk_src[il];
-        const int64_t k_sel    = top_k->ne[0];
-        const int64_t n_raw    = raw_k->ne[2];
+        const int64_t k_sel = top_k->ne[0];
+        const int64_t n_raw = raw_k->ne[2];
 
-        // tokens of each stream are contiguous in the ubatch (split_equal), n_tps per stream
-        const int64_t n_tps = nt/n_stream;
-        GGML_ASSERT(n_tps*n_stream == nt);
-
-        // few queries per stream: attend over [window | top-k rows of the query], one FA stream per query; same keys and mask as dense, different key order
-        const bool gather = sparse && cparams.flash_attn && raw_mask->type == GGML_TYPE_F16 && ci.kq_mask->type == GGML_TYPE_F16 &&
-                n_tps <= 32;
-
-        if (gather) {
-            // ggml_top_k returns the rows in no fixed order and FA sums the keys in that order: sort them so the result is deterministic
-            ggml_tensor *& sel = gather_sel_of[topk_src];
-            if (!sel) {
-                GGML_ASSERT(n_comp <= (INT64_C(1) << 24)); // row ids are exact in F32
-                ggml_tensor * ids = ggml_reshape_2d(ctx0, top_k, k_sel, nt);
-                ggml_tensor * ord = ggml_argsort(ctx0, ggml_cast(ctx0, ids, GGML_TYPE_F32), GGML_SORT_ORDER_ASC);
-                sel = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ids, 1, k_sel, nt), ord), k_sel, nt);
-                cb(sel, "comp_top_k_sorted", il);
+        // dense attention over [window | all compressed rows], selection applied as a mask
+        ggml_tensor * comp_k = ggml_view_4d(ctx0, comp_all, n_embd_head, 1, n_comp, n_stream,
+                comp_all->nb[1], comp_all->nb[2], comp_all->nb[3], 0);
+        if (k_rot) {
+            // compressed rows are stored unrotated: rotate in F32, then cast to the cache type
+            comp_k = comp_k->type != GGML_TYPE_F32 ? ggml_cast(ctx0, comp_k, GGML_TYPE_F32) : ggml_cont(ctx0, comp_k);
+            comp_k = llama_mul_mat_hadamard(ctx0, comp_k, k_rot);
+            if (comp_k->type != raw_k->type) {
+                comp_k = ggml_cast(ctx0, comp_k, raw_k->type);
             }
-
-            // built once per (storage, top-k) pair
-            ggml_tensor *& comp_k = gather_k_of[{rd, topk_src}];
-            if (!comp_k) {
-                // each stream's tokens pick rows of their own stream: [k_sel*n_tps, 1, n_stream] ids into [n_embd_head, n_comp, 1, n_stream]
-                ggml_tensor * src_rows = ggml_view_4d(ctx0, comp_all, n_embd_head, n_comp, 1, n_stream,
-                        comp_all->nb[2], comp_all->nb[3], comp_all->nb[3], 0);
-                comp_k = ggml_get_rows(ctx0, src_rows, ggml_reshape_3d(ctx0, sel, k_sel*n_tps, 1, n_stream));
-                comp_k = ggml_reshape_4d(ctx0, comp_k, n_embd_head, 1, k_sel, nt); // F32 (get_rows dequantizes)
-                if (k_rot) {
-                    // quantized K cache: the window is stored rotated, the compressed rows are not
-                    comp_k = llama_mul_mat_hadamard(ctx0, comp_k, k_rot);
-                }
-                if (comp_k->type != raw_k->type) {
-                    comp_k = ggml_cast(ctx0, comp_k, raw_k->type); // exact: rows are raw_k->type values
-                }
-                cb(comp_k, "comp_k_sel", il);
-            }
-
-            if (n_tps > 1) {
-                // one window copy per query, next to the other queries of its stream: [n_embd_head, n_raw, n_tps, n_stream]
-                GGML_ASSERT(raw_k->ne[1] == 1);
-                ggml_tensor * win = ggml_view_4d(ctx0, raw_k, n_embd_head, n_raw, 1, n_stream,
-                        raw_k->nb[2], raw_k->nb[3], raw_k->nb[3], 0);
-                if (ggml_is_quantized(raw_k->type)) {
-                    // no REPEAT kernel for quantized types: byte-exact copies by doubling concats
-                    ggml_tensor * rep = nullptr;
-                    ggml_tensor * pw  = win;
-                    for (int64_t n = n_tps; n > 0; n >>= 1) {
-                        if (n & 1) {
-                            rep = rep ? ggml_concat(ctx0, rep, pw, 2) : pw;
-                        }
-                        if (n > 1) {
-                            pw = ggml_concat(ctx0, pw, pw, 2);
-                        }
-                    }
-                    win = rep;
-                } else {
-                    win = ggml_repeat_4d(ctx0, win, n_embd_head, n_raw, n_tps, n_stream);
-                }
-                raw_k = ggml_reshape_4d(ctx0, win, n_embd_head, 1, n_raw, nt);
-            }
-            ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
-
-            // window mask, then the comp mask at the selected rows (-inf where top-k picked an invisible row); one per top-k source
-            ggml_tensor *& kq_mask = gather_mask_of[topk_src];
-            if (!kq_mask) {
-                ggml_tensor * sel_mask = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ci.kq_mask, 1, n_comp, nt), sel);
-                sel_mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, sel_mask, k_sel, 1, 1, nt), GGML_TYPE_F16);
-                kq_mask = ggml_concat(ctx0, ggml_reshape_4d(ctx0, raw_mask, raw_mask->ne[0], 1, 1, nt), sel_mask, 0);
-                cb(kq_mask, "comp_kq_mask_sel", il);
-            }
-
-            out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, nullptr, layer.attn_sinks, nullptr, 0, kq_scale, il);
-        } else {
-            // dense attention over [window | all compressed rows], selection applied as a mask
-            ggml_tensor * comp_k = ggml_view_4d(ctx0, comp_all, n_embd_head, 1, n_comp, n_stream,
-                    comp_all->nb[1], comp_all->nb[2], comp_all->nb[3], 0);
-            if (k_rot) {
-                // compressed rows are stored unrotated: rotate in F32, then cast to the cache type
-                comp_k = comp_k->type != GGML_TYPE_F32 ? ggml_cast(ctx0, comp_k, GGML_TYPE_F32) : ggml_cont(ctx0, comp_k);
-                comp_k = llama_mul_mat_hadamard(ctx0, comp_k, k_rot);
-                if (comp_k->type != raw_k->type) {
-                    comp_k = ggml_cast(ctx0, comp_k, raw_k->type);
-                }
-            } else if (ggml_is_quantized(comp_k->type)) {
-                // quantized cache without rotation (LLAMA_ATTN_ROT_DISABLE=1): via F32 for the same reason
-                comp_k = ggml_cast(ctx0, ggml_cast(ctx0, comp_k, GGML_TYPE_F32), raw_k->type);
-            } else {
-                comp_k = comp_k->type != raw_k->type ? ggml_cast(ctx0, comp_k, raw_k->type) : ggml_cont(ctx0, comp_k);
-            }
-            cb(comp_k, "comp_k", il);
-            ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
-
-            ggml_tensor * sel_mask = build_top_k_mask(ci.kq_mask, top_k, "comp_top_k_mask", il);
-            ggml_tensor * kq_mask  = ggml_concat(ctx0, raw_mask, sel_mask, 0);
-            cb(kq_mask, "comp_kq_mask", il);
-
-            // at most window + top-k visible columns per query: lets CUDA FA gather only those
-            const int64_t n_kv_max = sparse ? std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + k_sel : 0;
-            out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, nullptr, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
+        } else if (ggml_is_quantized(comp_k->type)) {
+            // quantized cache without rotation (LLAMA_ATTN_ROT_DISABLE=1): via F32 for the same reason
+            comp_k = ggml_cast(ctx0, ggml_cast(ctx0, comp_k, GGML_TYPE_F32), raw_k->type);
+        } else if (comp_k->type != raw_k->type) {
+            comp_k = ggml_cast(ctx0, comp_k, raw_k->type);
         }
+        cb(comp_k, "comp_k", il);
+        ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+
+        ggml_tensor * sel_mask = build_top_k_mask(ci.kq_mask, top_k, "comp_top_k_mask", il);
+        ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, sel_mask, 0);
+        cb(kq_mask, "comp_kq_mask", il);
+
+        // at most window + top-k visible columns per query: lets the sparse FA path gather only those
+        const int64_t n_kv_max = sparse ? std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + k_sel : 0;
+        out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, nullptr, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
         if (k_rot) {
             out = llama_mul_mat_hadamard(ctx0, out, k_rot);
         }
