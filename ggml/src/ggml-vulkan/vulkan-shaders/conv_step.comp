@@ -1,0 +1,57 @@
+#version 450
+
+// Fused short-conv decode step (one new token per sequence), one thread per (channel, seq):
+//   window = [past[0..n_conv-2], x_new]
+//   state  = window[1..n_conv-1]                      (CPY of the concat tail)
+//   dst    = (residual + sum_j window[j] * w[j]) * scale (SSM_CONV, ADD, SCALE)
+// replaces CONCAT, CPY, SSM_CONV, ADD, SCALE (inkling2 convolve()).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint ch; uint n_seqs; uint n_conv;
+    uint p_off; uint p_nb0; uint p_nb1; uint p_nb2;
+    uint x_off; uint x_nb1; uint x_nb2;
+    uint w_off;
+    uint s_off; uint s_nb1;
+    uint r_off; uint r_nb1;
+    uint d_off; uint d_nb1;
+    float scale;
+};
+
+layout(binding = 0, std430) readonly  buffer P { float data_p[]; };
+layout(binding = 1, std430) readonly  buffer X { float data_x[]; };
+layout(binding = 2, std430) readonly  buffer W { float data_w[]; };
+layout(binding = 3, std430) writeonly buffer S { float data_s[]; };
+layout(binding = 4, std430) readonly  buffer R { float data_r[]; };
+layout(binding = 5, std430) writeonly buffer D { float data_d[]; };
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= ch * n_seqs) {
+        return;
+    }
+    const uint c = idx % ch;
+    const uint s = idx / ch;
+
+    const uint pb = p_off + c * p_nb1 + s * p_nb2;
+    const uint wb = w_off + c * n_conv;
+    const uint sb = s_off + s * s_nb1 + c * (n_conv - 1);
+
+    const float xn  = data_x[x_off + c * x_nb1 + s * x_nb2];
+    const float res = data_r[r_off + c + s * r_nb1];
+
+    float acc = 0.0f;
+    // window[0] only feeds the conv; window[j] (j >= 1) also goes to state[j - 1]
+    acc += data_p[pb] * data_w[wb];
+    for (uint j = 1; j + 1 < n_conv; ++j) {
+        const float v = data_p[pb + j * p_nb0];
+        acc += v * data_w[wb + j];
+        data_s[sb + j - 1] = v;
+    }
+    acc += xn * data_w[wb + n_conv - 1];
+    data_s[sb + n_conv - 2] = xn;
+
+    data_d[d_off + c + s * d_nb1] = (res + acc) * scale;
+}

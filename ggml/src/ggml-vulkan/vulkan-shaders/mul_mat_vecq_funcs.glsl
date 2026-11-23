@@ -584,3 +584,121 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     return sum;
 }
 #endif
+
+#if defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S)
+// Sign handling via a shared table of byte masks: iq_smask[s] = (mask for bits 0..3, mask for bits 4..7), 0xFF per negated byte.
+// Grid bytes are in (0,128), so (b ^ 0xFF) + 1 = -b never carries into the next byte.
+// 7-bit-sign types (ksigns: 8th bit = parity) bake the parity bit into a 128-entry table indexed by the raw 7 bits.
+#if defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ3_XXS)
+#define IQ_SMASK_N 128
+#else
+#define IQ_SMASK_N 256
+#endif
+shared uvec2 iq_smask[IQ_SMASK_N];
+#define IQ_SMASK_INIT
+void init_iq_smask() {
+    [[unroll]] for (uint i0 = 0; i0 < IQ_SMASK_N; i0 += gl_WorkGroupSize.x) {
+        const uint i = i0 + gl_LocalInvocationIndex.x;
+        if (i < IQ_SMASK_N) {
+            const uint s8 = IQ_SMASK_N == 128 ? (i | ((bitCount(i) & 1u) << 7)) : i;
+            const uint lo = ((s8 & 0xFu) * 0x00204081u) & 0x01010101u;
+            const uint hi = ((s8 >> 4)   * 0x00204081u) & 0x01010101u;
+            iq_smask[i] = uvec2(lo * 0xFFu, hi * 0xFFu);
+        }
+    }
+}
+// dot of 8 grid values (uvec2) with sign index s against cache_b_qs[2k], [2k+1]
+int32_t iq_dot8(const uvec2 g, const uint s, const uint k) {
+    const uvec2 m = iq_smask[s];
+    return dotPacked4x8EXT(int32_t((g.x ^ m.x) + (m.x & 0x01010101u)), cache_b_qs[2 * k]) +
+           dotPacked4x8EXT(int32_t((g.y ^ m.y) + (m.y & 0x01010101u)), cache_b_qs[2 * k + 1]);
+}
+#endif
+
+#if defined(DATA_A_IQ2_XXS)
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    const uint ib = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+    const uint qs01 = uint(data_a_packed16[ib].qs[4 * ib32 + 0]) | (uint(data_a_packed16[ib].qs[4 * ib32 + 1]) << 16);
+    const uint signscale = uint(data_a_packed16[ib].qs[4 * ib32 + 2]) | (uint(data_a_packed16[ib].qs[4 * ib32 + 3]) << 16);
+    int32_t q_sum = 0;
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uvec2 g = iq2xxs_grid[(qs01 >> (8 * k)) & 0xFF];
+        q_sum += iq_dot8(g, bitfieldExtract(signscale, 7 * int(k), 7), k);
+    }
+    const float db = float(data_a[ib].d) * 0.25 * (0.5 + float(signscale >> 28));
+    return FLOAT_TYPE(float(cache_b_ds.x) * db * float(q_sum));
+}
+#endif
+
+#if defined(DATA_A_IQ2_XS)
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    const uint ib = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+    int32_t q_sum0 = 0, q_sum1 = 0;
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uint qs = uint(data_a[ib].qs[4 * ib32 + k]);
+        const int32_t s = iq_dot8(iq2xs_grid[qs & 511], qs >> 9, k);
+        if (k < 2) { q_sum0 += s; } else { q_sum1 += s; }
+    }
+    const uint sc = uint(data_a[ib].scales[ib32]);
+    const float d = float(data_a[ib].d) * 0.25;
+    const float sum = d * ((0.5 + float(sc & 0xF)) * float(q_sum0) + (0.5 + float(sc >> 4)) * float(q_sum1));
+    return FLOAT_TYPE(float(cache_b_ds.x) * sum);
+}
+#endif
+
+#if defined(DATA_A_IQ2_S)
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    const uint ib = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+    const uint qs = uint(data_a_packed16[ib].qs[2 * ib32]) | (uint(data_a_packed16[ib].qs[2 * ib32 + 1]) << 16);
+    const uint sg = uint(data_a_packed16[ib].qs[QUANT_K / 16 + 2 * ib32]) | (uint(data_a_packed16[ib].qs[QUANT_K / 16 + 2 * ib32 + 1]) << 16);
+    const uint qh = uint(data_a[ib].qh[ib32]);
+    int32_t q_sum0 = 0, q_sum1 = 0;
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uint idx = ((qs >> (8 * k)) & 0xFF) | (((qh >> (2 * k)) & 3) << 8);
+        const int32_t s = iq_dot8(iq2s_grid[idx], (sg >> (8 * k)) & 0xFF, k);
+        if (k < 2) { q_sum0 += s; } else { q_sum1 += s; }
+    }
+    const uint sc = uint(data_a[ib].scales[ib32]);
+    const float d = float(data_a[ib].d) * 0.25;
+    const float sum = d * ((0.5 + float(sc & 0xF)) * float(q_sum0) + (0.5 + float(sc >> 4)) * float(q_sum1));
+    return FLOAT_TYPE(float(cache_b_ds.x) * sum);
+}
+#endif
+
+#if defined(DATA_A_IQ3_XXS)
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    const uint ib = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+    const uint signscale = uint(data_a_packed16[ib].qs[QUANT_K / 8 + 2 * ib32]) | (uint(data_a_packed16[ib].qs[QUANT_K / 8 + 2 * ib32 + 1]) << 16);
+    int32_t q_sum = 0;
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uint q2 = uint(data_a_packed16[ib].qs[4 * ib32 + k]);
+        const uvec2 g = uvec2(iq3xxs_grid[q2 & 0xFF], iq3xxs_grid[q2 >> 8]);
+        q_sum += iq_dot8(g, bitfieldExtract(signscale, 7 * int(k), 7), k);
+    }
+    const float db = float(data_a[ib].d) * 0.5 * (0.5 + float(signscale >> 28));
+    return FLOAT_TYPE(float(cache_b_ds.x) * db * float(q_sum));
+}
+#endif
+
+#if defined(DATA_A_IQ3_S)
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    const uint ib = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+    const uint qh = uint(data_a[ib].qh[ib32]);
+    const uint sg = uint(data_a_packed16[ib].signs[2 * ib32]) | (uint(data_a_packed16[ib].signs[2 * ib32 + 1]) << 16);
+    int32_t q_sum = 0;
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uint q2 = uint(data_a_packed16[ib].qs[4 * ib32 + k]);
+        const uvec2 g = uvec2(iq3s_grid[(q2 & 0xFF) | (((qh >> (2 * k)) & 1) << 8)],
+                              iq3s_grid[(q2 >> 8)   | (((qh >> (2 * k + 1)) & 1) << 8)]);
+        q_sum += iq_dot8(g, (sg >> (8 * k)) & 0xFF, k);
+    }
+    const uint scale = (uint(data_a[ib].scales[ib32 / 2]) >> (4 * (ib32 & 1))) & 0xF;
+    const float db = float(data_a[ib].d) * float(1 + 2 * scale);
+    return FLOAT_TYPE(float(cache_b_ds.x) * db * float(q_sum));
+}
+#endif

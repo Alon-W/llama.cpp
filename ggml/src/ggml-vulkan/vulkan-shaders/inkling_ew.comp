@@ -1,0 +1,93 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// Fused elementwise chains of inkling2 (one output element per thread, inputs with arbitrary row strides):
+// MODE 0 (loop control tail): dst = c - tanh(a)*c + tanh(b)*d           a=forget, b=gain, c=cur, d=message
+// MODE 1 (SiTU activation):   dst = p1*tanh(p0*a) * sigmoid(a) * p3*tanh(p2*b)   a=gate, b=up
+
+// MODE 2: SiTU for small tensors in one workgroup: every input is read into registers before any write, so dst may alias the inputs
+layout(constant_id = 0) const uint MODE = 0;
+layout(constant_id = 1) const uint WG = 256;
+
+layout(local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint ne0; uint ne1; uint ne2; uint ne3;
+    uint a1; uint a2; uint a3;
+    uint b1; uint b2; uint b3;
+    uint c1; uint c2; uint c3;
+    uint e1; uint e2; uint e3;   // d (message) strides
+    uint d1; uint d2; uint d3;   // dst strides
+    uint a_off; uint b_off; uint c_off; uint e_off; uint d_off;
+    float p0; float p1; float p2; float p3;
+};
+
+layout(binding = 0, std430) readonly buffer A { float data_a[]; };
+layout(binding = 1, std430) readonly buffer B { float data_b[]; };
+layout(binding = 2, std430) readonly buffer C { float data_c[]; };
+layout(binding = 3, std430) readonly buffer E { float data_e[]; };
+layout(binding = 4, std430) writeonly buffer D { float data_d[]; };
+
+float situ(const float a, const float b) {
+    return (p1 * tanh(p0 * a)) * (1.0f / (1.0f + exp(-a))) * (p3 * tanh(p2 * b));
+}
+
+// element index -> (i0, i1, i2, i3); one division for the usual 2D case
+uvec4 split_index(const uint idx) {
+    uint i1 = idx / ne0;
+    const uint i0 = idx - i1 * ne0;
+    uint i2 = 0, i3 = 0;
+    if (ne2 * ne3 > 1) {
+        i2 = i1 / ne1; i1 -= i2 * ne1;
+        i3 = i2 / ne2; i2 -= i3 * ne2;
+    }
+    return uvec4(i0, i1, i2, i3);
+}
+
+const uint PER_THREAD = 12; // 1024 threads x 12 = 12288 values, matches the host-side limit
+
+void main() {
+    if (MODE == 2) {
+        // one workgroup: every input is loaded into registers (all loads issued up front) before any write,
+        // so dst may alias the inputs
+        const uint n = ne0 * ne1 * ne2 * ne3;
+        float va[PER_THREAD];
+        float vb[PER_THREAD];
+        [[unroll]] for (uint k = 0; k < PER_THREAD; ++k) {
+            const uint idx = gl_LocalInvocationID.x + k * WG;
+            const uvec4 i = split_index(min(idx, n - 1));
+            va[k] = data_a[a_off + i.x + i.y * a1 + i.z * a2 + i.w * a3];
+            vb[k] = data_b[b_off + i.x + i.y * b1 + i.z * b2 + i.w * b3];
+        }
+        memoryBarrierBuffer();
+        barrier();
+        [[unroll]] for (uint k = 0; k < PER_THREAD; ++k) {
+            const uint idx = gl_LocalInvocationID.x + k * WG;
+            if (idx < n) {
+                const uvec4 i = split_index(idx);
+                data_d[d_off + i.x + i.y * d1 + i.z * d2 + i.w * d3] = situ(va[k], vb[k]);
+            }
+        }
+        return;
+    }
+
+    const uint idx = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * WG;
+    if (idx >= ne0 * ne1 * ne2 * ne3) {
+        return;
+    }
+    const uvec4 i = split_index(idx);
+
+    const float a = data_a[a_off + i.x + i.y * a1 + i.z * a2 + i.w * a3];
+    const float b = data_b[b_off + i.x + i.y * b1 + i.z * b2 + i.w * b3];
+    float v;
+    if (MODE == 0) {
+        const float c = data_c[c_off + i.x + i.y * c1 + i.z * c2 + i.w * c3];
+        const float e = data_e[e_off + i.x + i.y * e1 + i.z * e2 + i.w * e3];
+        v = c - tanh(a) * c + tanh(b) * e;
+    } else {
+        v = situ(a, b);
+    }
+    data_d[d_off + i.x + i.y * d1 + i.z * d2 + i.w * d3] = v;
+}

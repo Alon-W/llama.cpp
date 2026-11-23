@@ -1,0 +1,57 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// Fused row-norm clip, one workgroup per row:
+//   dst = x * clamp(fill / (scale*sqrt(sum(x^2)) + bias), lo, hi)
+// replaces SQR, SUM_ROWS, SQRT, SCALE, FILL, DIV, CLAMP, MUL (see inkling2 clip()).
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 128;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint ne00;
+    uint nb01; uint nb02; uint nb03;   // x strides in elements
+    uint nbd1; uint nbd2; uint nbd3;   // dst strides in elements
+    uint x_offset;
+    uint d_offset;
+    float scale;
+    float bias;
+    float fill;
+    float lo;
+    float hi;
+};
+
+layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+layout(binding = 1, std430) writeonly buffer D { float data_d[]; };
+
+shared float sums[BLOCK_SIZE];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint xb = x_offset + gl_WorkGroupID.x * nb01 + gl_WorkGroupID.y * nb02 + gl_WorkGroupID.z * nb03;
+    const uint db = d_offset + gl_WorkGroupID.x * nbd1 + gl_WorkGroupID.y * nbd2 + gl_WorkGroupID.z * nbd3;
+
+    float s = 0.0f;
+    for (uint i = tid; i < ne00; i += BLOCK_SIZE) {
+        const float v = data_x[xb + i];
+        s += v * v;
+    }
+    sums[tid] = s;
+    barrier();
+    [[unroll]] for (uint k = BLOCK_SIZE / 2; k > 0; k >>= 1) {
+        if (tid < k) {
+            sums[tid] += sums[tid + k];
+        }
+        barrier();
+    }
+
+    const float norm = sqrt(sums[0]) * scale + bias;
+    const float f = clamp(fill / norm, lo, hi);
+
+    for (uint i = tid; i < ne00; i += BLOCK_SIZE) {
+        data_d[db + i] = data_x[xb + i] * f;
+    }
+}

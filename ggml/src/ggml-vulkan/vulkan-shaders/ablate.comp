@@ -1,0 +1,70 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Fused direction ablation, one workgroup per row:
+//   dst = x - r * dot(r, x)
+// replaces MUL_MAT(r_col, x), MUL_MAT(r_row, dot), SUB (llama-graph build_lora_ablate).
+// Rows up to BLOCK_SIZE*CACHE elements stay in registers between the dot and the write; longer rows are re-read.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+#define CACHE 16
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint ne00;
+    uint nb01; uint nb02; uint nb03;   // x strides in elements
+    uint nbd1; uint nbd2; uint nbd3;   // dst strides in elements
+    uint x_offset;
+    uint r_offset;
+    uint d_offset;
+};
+
+layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+layout(binding = 1, std430) readonly buffer R { float data_r[]; };
+layout(binding = 2, std430) writeonly buffer D { float data_d[]; };
+
+shared float partial[32];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint xb = x_offset + gl_WorkGroupID.x * nb01 + gl_WorkGroupID.y * nb02 + gl_WorkGroupID.z * nb03;
+    const uint db = d_offset + gl_WorkGroupID.x * nbd1 + gl_WorkGroupID.y * nbd2 + gl_WorkGroupID.z * nbd3;
+
+    float xv[CACHE];
+    float rv[CACHE];
+    float s = 0.0f;
+    [[unroll]] for (uint k = 0; k < CACHE; ++k) {
+        const uint i = tid + k * BLOCK_SIZE;
+        xv[k] = i < ne00 ? data_x[xb + i] : 0.0f;
+        rv[k] = i < ne00 ? data_r[r_offset + i] : 0.0f;
+        s += xv[k] * rv[k];
+    }
+    for (uint i = tid + CACHE * BLOCK_SIZE; i < ne00; i += BLOCK_SIZE) {
+        s += data_r[r_offset + i] * data_x[xb + i];
+    }
+
+    s = subgroupAdd(s);
+    if (subgroupElect()) {
+        partial[gl_SubgroupID] = s;
+    }
+    barrier();
+    float d = 0.0f;
+    for (uint k = 0; k < gl_NumSubgroups; ++k) {
+        d += partial[k];
+    }
+
+    [[unroll]] for (uint k = 0; k < CACHE; ++k) {
+        const uint i = tid + k * BLOCK_SIZE;
+        if (i < ne00) {
+            data_d[db + i] = xv[k] - rv[k] * d;
+        }
+    }
+    for (uint i = tid + CACHE * BLOCK_SIZE; i < ne00; i += BLOCK_SIZE) {
+        data_d[db + i] = data_x[xb + i] - data_r[r_offset + i] * d;
+    }
+}

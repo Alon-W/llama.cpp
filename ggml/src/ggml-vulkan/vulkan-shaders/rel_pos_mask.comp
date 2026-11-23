@@ -1,0 +1,50 @@
+#version 450
+
+#include "types.glsl"
+
+// per-head attention mask from a relative-position bias table: dst[c, i, h, s] = table[rel_pos[c, t], h, t] + mask[c, i, s]
+// one thread per cell: rel_pos and the mask are read once, the head loop writes coalesced rows
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_kv; uint n_q; uint n_head;
+    uint nbt0; uint nbt1; uint nbt2;
+    uint nbr1;
+    uint nbm1; uint nbm3;
+    uint nbd1; uint nbd2; uint nbd3;
+    uint t_offset; uint r_offset; uint m_offset; uint d_offset;
+    uint has_sub; uint nbs1; uint nbs2; uint s_offset;   // optional [1, n_head, n_tokens] subtracted from the table
+} p;
+
+layout(binding = 0, std430) readonly  buffer T { float  data_t[]; };
+layout(binding = 1, std430) readonly  buffer R { int    data_r[]; };
+layout(binding = 2, std430) readonly  buffer M { M_TYPE data_m[]; };
+layout(binding = 3, std430) writeonly buffer D { D_TYPE data_d[]; };
+layout(binding = 4, std430) readonly  buffer S { float  data_s[]; };
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    const uint i = gl_WorkGroupID.y;
+    const uint s = gl_WorkGroupID.z;
+    if (c >= p.n_kv) {
+        return;
+    }
+    const uint t = s*p.n_q + i;
+
+    const uint  idx = uint(data_r[p.r_offset + t*p.nbr1 + c]);
+    const float m   = float(data_m[p.m_offset + i*p.nbm1 + s*p.nbm3 + c]);
+
+    const uint tb = p.t_offset + idx*p.nbt0 + t*p.nbt2;
+    const uint db = p.d_offset + i*p.nbd1 + s*p.nbd3 + c;
+    if (p.has_sub != 0) {
+        const uint sb = p.s_offset + t*p.nbs2;
+        for (uint h = 0; h < p.n_head; ++h) {
+            data_d[db + h*p.nbd2] = D_TYPE((data_t[tb + h*p.nbt1] - data_s[sb + h*p.nbs1]) + m);
+        }
+    } else {
+        for (uint h = 0; h < p.n_head; ++h) {
+            data_d[db + h*p.nbd2] = D_TYPE(data_t[tb + h*p.nbt1] + m);
+        }
+    }
+}

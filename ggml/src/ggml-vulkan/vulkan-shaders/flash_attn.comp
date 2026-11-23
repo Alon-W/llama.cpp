@@ -202,7 +202,8 @@ void main() {
                 continue;
             }
             // Only load if the block is not all zeros
-            if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
+            // a block of zero mask still carries the relative-position bias
+            if (REL_POS || mask_opt_bits != MASK_OPT_ALL_ZERO) {
                 bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
 
                 float max_mask = NEG_FLT_MAX_OVER_2;
@@ -214,7 +215,18 @@ void main() {
                         uint32_t kcol;
                         bool kv_active = fa_kv_index(j * Bc + c, kcol);
                         if (kv_active && (!nem1_bounds_check || i * Br + r < p.nem1)) {
-                            FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + kcol]);
+                            FLOAT_TYPE m;
+                            if (REL_POS) {
+                                const uint32_t t = i * Br + r;
+                                const uint32_t n_rel = floatBitsToUint(p.m0);
+                                float b = data_rt[uint32_t(data_rr[t * m_stride + kcol]) + (iq2 + t * p.neq2) * n_rel];
+                                if (p.m1 != 0.0f) {
+                                    b -= data_rs[iq2 + t * p.neq2];
+                                }
+                                m = FLOAT_TYPE(round_to_f16(b + float(data_m[m_offset + t * m_stride + kcol])));
+                            } else {
+                                m = FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + kcol]);
+                            }
                             masksh[c * masksh_stride + r] = m;
                             max_mask = max(max_mask, float(m));
                         } else {
@@ -452,7 +464,7 @@ void main() {
             }
         }
 
-        if (MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO) {
+        if (MASK_ENABLE && (REL_POS || mask_opt_bits != MASK_OPT_ALL_ZERO)) {
             [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                     FLOAT_TYPE mvf = masksh[(c * cols_per_iter + col_tid) * masksh_stride + tile_row(r)];

@@ -30,6 +30,9 @@ const bool Q_IN_REGS       = (Flags & 32) != 0;
 // coopmat1: subgroups own Q rows, O in coopmat accumulators. K/V staged in LDS, or loaded from global memory with FLIP_DIRECT.
 const bool FLIP            = (Flags & 64) != 0;
 const bool FLIP_DIRECT     = (Flags & 128) != 0;
+// per-head relative-position bias read from bindings 8-10 instead of a per-head mask (ggml_flash_attn_ext_set_rel_pos);
+// the table row count rides in m0 and the sub flag in m1 (ALiBi is off)
+const bool REL_POS         = (Flags & 256) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -89,6 +92,30 @@ layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 
 layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
+
+layout (binding = 8)  readonly buffer RT {float   data_rt[];};
+layout (binding = 9)  readonly buffer RR {int32_t data_rr[];};
+layout (binding = 10) readonly buffer RS {float   data_rs[];};
+
+// f32 -> the nearest f16 value (round to nearest even) as a float: what a stored f16 mask would hold
+float round_to_f16(float x) {
+    const uint u = floatBitsToUint(x);
+    const uint e = (u >> 23) & 0xFFu;
+    if (e == 0xFFu) {
+        return x;
+    }
+    if (e < 113u) {
+        // below the f16 normal range: subnormal step 2^-24
+        return roundEven(x * 16777216.0) * (1.0 / 16777216.0);
+    }
+    uint r = u + 0xFFFu + ((u >> 13) & 1u);
+    r &= ~0x1FFFu;
+    if (((r >> 23) & 0xFFu) > 142u) {
+        // above 65504
+        return uintBitsToFloat((u & 0x80000000u) | 0x7F800000u);
+    }
+    return uintBitsToFloat(r);
+}
 
 // Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, e.g. when computing Mold-M.
 #define NEG_FLT_MAX_OVER_2 uintBitsToFloat(0xFEFFFFFF)
@@ -220,7 +247,8 @@ void init_indices()
     // "p.gqa_ratio >> 16" is just a roundabout way of writing zero
     // that prevents the compiler from folding the "&" through the select
     // and breaking the alignment detection.
-    m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
+    // A mask per head (nem2 > 1) steps by one head per row instead.
+    m_stride = (p.gqa_ratio > 1) ? (p.nem2 > 1 ? p.nem1 * KV : (p.gqa_ratio >> 16)) : KV;
 
     // Sparse: the tile shares one mask row (gqa heads, or Br==1). split_k
     // partitions the n_kv_max blocks.

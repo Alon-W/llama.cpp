@@ -544,6 +544,12 @@ static constexpr std::initializer_list<ggml_op> topk_moe_sigmoid_norm_bias{ GGML
                                                                             GGML_OP_RESHAPE,  GGML_OP_SUM_ROWS, GGML_OP_CLAMP,
                                                                             GGML_OP_DIV,      GGML_OP_RESHAPE };
 
+// same with the weight sum guarded by sum + eps (ggml_scale_bias, expert_weights_norm_eps > 0) instead of a clamp
+static constexpr std::initializer_list<ggml_op> topk_moe_sigmoid_norm_bias_eps{ GGML_OP_UNARY,    GGML_OP_RESHAPE,  GGML_OP_ADD,
+                                                                                GGML_OP_ARGSORT,  GGML_OP_VIEW,     GGML_OP_GET_ROWS,
+                                                                                GGML_OP_RESHAPE,  GGML_OP_SUM_ROWS, GGML_OP_SCALE,
+                                                                                GGML_OP_DIV,      GGML_OP_RESHAPE };
+
 static constexpr std::initializer_list<ggml_op> topk_moe_sqrt_softplus_norm_bias{ GGML_OP_UNARY,    GGML_OP_SQRT,
                                                                                   GGML_OP_RESHAPE,  GGML_OP_ADD,
                                                                                   GGML_OP_ARGSORT,  GGML_OP_VIEW,
@@ -585,6 +591,53 @@ static constexpr std::initializer_list<ggml_op> rms_norm_mul_rope_view_set_rows_
 static constexpr std::initializer_list<ggml_op> rms_norm_view_set_rows_pattern { GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
 static constexpr std::initializer_list<ggml_op> rope_view_set_rows_pattern { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+
+// x * clamp(fill / (scale*sqrt(sum_rows(x^2)) + bias), lo, hi): row-norm clip (inkling2 clip())
+static constexpr std::initializer_list<ggml_op> l2_clip_pattern { GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
+
+// x - r * (r . x): abliteration adapter projection (llama-graph build_lora_ablate)
+static constexpr std::initializer_list<ggml_op> ablate_pattern { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_SUB };
+
+static constexpr std::initializer_list<std::array<int, 3>> ablate_edges {
+    { 1, 1, 0 }, // mul_mat(r_row)->src[1] == dot
+    { 2, 1, 1 }, // sub->src[1]            == outer product
+};
+
+static constexpr std::initializer_list<std::array<int, 3>> l2_clip_edges {
+    { 1, 0, 0 }, // sum_rows->src[0] == sqr
+    { 2, 0, 1 }, // sqrt->src[0]     == sum_rows
+    { 3, 0, 2 }, // scale->src[0]    == sqrt
+    { 4, 0, 3 }, // fill->src[0]     == scale (shape only)
+    { 5, 0, 4 }, // div->src[0]      == fill
+    { 5, 1, 3 }, // div->src[1]      == scale
+    { 6, 0, 5 }, // clamp->src[0]    == div
+    { 7, 1, 6 }, // mul->src[1]      == clamp
+};
+
+// inkling2 loop control tail: cur - tanh(forget)*cur + tanh(gain)*message
+static constexpr std::initializer_list<ggml_op> loop_ctrl_pattern { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+
+static constexpr std::initializer_list<std::array<int, 3>> loop_ctrl_edges {
+    { 1, 0, 0 }, // mul->src[0]  == tanh(forget)
+    { 2, 1, 1 }, // sub->src[1]  == forget*cur
+    { 4, 0, 3 }, // mul->src[0]  == tanh(gain)
+    { 5, 0, 2 }, // add->src[0]  == sub
+    { 5, 1, 4 }, // add->src[1]  == gain*message
+};
+
+// inkling2 SiTU: beta*tanh(gate/beta) * sigmoid(gate) * lb*tanh(up/lb)
+static constexpr std::initializer_list<ggml_op> situ_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+
+static constexpr std::initializer_list<std::array<int, 3>> situ_edges {
+    { 1, 0, 0 }, // tanh->src[0]  == scale(gate)
+    { 2, 0, 1 }, // scale->src[0] == tanh
+    { 4, 0, 2 }, // mul->src[0]   == scaled tanh
+    { 4, 1, 3 }, // mul->src[1]   == sigmoid(gate)
+    { 6, 0, 5 }, // tanh->src[0]  == scale(up)
+    { 7, 0, 6 }, // scale->src[0] == tanh
+    { 8, 0, 4 }, // mul->src[0]   == act
+    { 8, 1, 7 }, // mul->src[1]   == scaled tanh(up)
+};
 
 // scale_out*sigmoid(scale_in*x) as the hc_post weights (qwen4exp hc_combine)
 static constexpr std::initializer_list<ggml_op> hc_post_gate_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
@@ -991,6 +1044,17 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
+    vk_pipeline pipeline_l2_clip_f32;
+    vk_pipeline pipeline_ablate_f32;
+    vk_pipeline pipeline_depth_mix_f32;
+    vk_pipeline pipeline_depth_scores_f32;
+    vk_pipeline pipeline_depth_mix_scored_f32;
+    vk_pipeline pipeline_loop_gate_f32;
+    vk_pipeline pipeline_loop_apply_f32;
+    vk_pipeline pipeline_conv_step_f32;
+    vk_pipeline pipeline_rel_pos_mask_f16_f16;
+    vk_pipeline pipeline_rel_pos_mask_f32_f16;
+    vk_pipeline pipeline_inkling_ew_f32[3];
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;
@@ -1367,6 +1431,13 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    bool fused_l2_clip {};
+    bool fused_ablate {};
+    // CONCAT, CPY, SSM_CONV, ADD, SCALE decode step (inkling2 convolve): positions of CPY, SSM_CONV, ADD, SCALE relative to the CONCAT
+    int fused_conv_step[4] {};
+    bool fused_conv_step_on {};
+    int fused_inkling_ew {-1};
+    bool fused_skip_overlap_check {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

@@ -537,9 +537,14 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
     const uint vui = data_a_packed32[a_offset + ib].qs[(sub * 8u + j) / 4u];
     return vec4(bitcastExtractfe2m1EXT(unpack8(vui), shift)) * d;
 #else
-    const vec2 v0 = dequantize(ib, iqs, a_offset);
-    const vec2 v1 = dequantize(ib, iqs + 2u, a_offset);
-    return vec4(v0.x, v0.y, v1.x, v1.y);
+    // bytes j..j+3 of the sub-block (j = 0 or 4) are one aligned word: one load and one scale conversion for 4 values
+    const uint sub = iqs >> 4;
+    const float d = ue4m3_to_fp32(data_a[a_offset + ib].d[sub]) * 0.5;
+    const uint j = iqs & 7;
+    const uint shift = (iqs & 8) >> 1; // 0 or 4
+    const uint vui = data_a_packed32[a_offset + ib].qs[(sub * 8u + j) / 4u] >> shift;
+    return vec4(float(kvalues_mxfp4[vui & 0xFu]),         float(kvalues_mxfp4[(vui >> 8) & 0xFu]),
+                float(kvalues_mxfp4[(vui >> 16) & 0xFu]), float(kvalues_mxfp4[(vui >> 24) & 0xFu])) * d;
 #endif
 }
 #endif
