@@ -1,3 +1,5 @@
+> **This fork (`inkling-rdna2`):** Inkling 2 Mini tuned for AMD RDNA2 on Vulkan: faster kernels, attention without the 800 MB per-head mask, and the official DSpark drafter. Results and usage: [INKLING-RDNA2.md](INKLING-RDNA2.md).
+
 # llama.cpp
 
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
