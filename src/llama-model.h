@@ -421,6 +421,10 @@ struct llama_layer {
 
     struct ggml_tensor * dflash_attn_conv_base = nullptr;
     struct ggml_tensor * dflash_attn_conv_proj = nullptr;
+    struct ggml_tensor * dflash_attn_k_ctx      = nullptr; // inkling2 draft context K/V from fused target features
+    struct ggml_tensor * dflash_attn_v_ctx      = nullptr;
+    struct ggml_tensor * dflash_attn_k_ctx_norm = nullptr;
+    struct ggml_tensor * dflash_dflare_norm     = nullptr;
     struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
     struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
 
@@ -929,6 +933,9 @@ struct llama_model {
     struct ggml_tensor * dspark_joint_proj   = nullptr; // rnn markov head
     struct ggml_tensor * dspark_joint_proj_b = nullptr;
     struct ggml_tensor * dspark_mask_embd    = nullptr; // per-slot mask embeddings
+    struct ggml_tensor * dspark_markov_norm  = nullptr; // inkling2 rnn head: f_rnn norm
+    struct ggml_tensor * dspark_markov_out   = nullptr; // inkling2 rnn head: latent -> hidden
+    struct ggml_tensor * dspark_markov_out_b = nullptr;
 
     // zaya1
     struct ggml_tensor * res_scale_in   = nullptr;

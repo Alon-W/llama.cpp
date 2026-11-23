@@ -494,6 +494,7 @@ enum llm_kv {
     LLM_KV_TARGET_LAYERS,
     LLM_KV_TARGET_HIDDEN_SIZE,
     LLM_KV_DFLASH_BLOCK_SIZE,
+    LLM_KV_DFLASH_FUSE_ALPHA,
     LLM_KV_DFLASH_CONV_KERNEL_SIZE,
     LLM_KV_DFLASH_CONV_GROUP_SIZE,
     LLM_KV_DFLASH_SELECTOR_RANK,
@@ -918,6 +919,12 @@ enum llm_tensor {
     LLM_TENSOR_DSPARK_CONF_PROJ,
     LLM_TENSOR_DSPARK_JOINT_PROJ,
     LLM_TENSOR_DSPARK_MASK_EMBD,
+    LLM_TENSOR_DSPARK_MARKOV_NORM,   // inkling2 rnn head: norm of the fused target features (f_rnn)
+    LLM_TENSOR_DSPARK_MARKOV_OUT,    // inkling2 rnn head: latent -> hidden correction
+    LLM_TENSOR_DFLASH_ATTN_K_CTX,    // inkling2 draft: context keys from the fused target features
+    LLM_TENSOR_DFLASH_ATTN_V_CTX,
+    LLM_TENSOR_DFLASH_ATTN_K_CTX_NORM,
+    LLM_TENSOR_DFLASH_DFLARE_NORM,   // inkling2 draft: per-layer norm of the fused target features
     LLM_TENSOR_ENGRAM_KV,
     LLM_TENSOR_ENGRAM_GATE,
     LLM_TENSOR_DFLASH_ATTN_CONV_BASE,

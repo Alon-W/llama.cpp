@@ -1722,6 +1722,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     layer_inp_src    (params.layer_inp_src),
     h_nextn_dev      (params.h_nextn_dev),
     h_nextn_src      (params.h_nextn_src),
+    dflash_ring      (params.dflash_ring),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1806,6 +1807,19 @@ ggml_tensor * llm_graph_context::build_rope_indexer(ggml_tensor * cur, ggml_tens
     return rp.n_rot > 0 && rp.n_offs > 0 ? ggml_rope_set_offset(res, rp.n_offs) : res;
 }
 
+// abliteration adapter (llama_adapter_lora::ablate): x - scale * r (r . x), r = first column of lora_b (unit, shared by all experts)
+static ggml_tensor * build_lora_ablate(ggml_context * ctx, ggml_tensor * x, ggml_tensor * b, float scale) {
+    const int64_t n = x->ne[0];
+    GGML_ASSERT(b->type == GGML_TYPE_F32 && b->ne[0] == 1 && b->ne[1] == n);
+    ggml_tensor * r_col = ggml_view_2d(ctx, b, n, 1, n*sizeof(float), 0); // [n, 1]
+    ggml_tensor * r_row = ggml_view_2d(ctx, b, 1, n, sizeof(float), 0);   // [1, n]
+    ggml_tensor * dot = ggml_mul_mat(ctx, r_col, x);                      // [1, ...]
+    if (scale != 1.0f) {
+        dot = ggml_scale(ctx, dot, scale);
+    }
+    return ggml_sub(ctx, x, ggml_mul_mat(ctx, r_row, dot));
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
@@ -1832,6 +1846,11 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
         const float adapter_scale = lora.second;
         const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
+
+        if (lora.first->ablate) {
+            res = build_lora_ablate(ctx0, res, lw->b, scale);
+            continue;
+        }
 
         ggml_tensor * ab_cur = ggml_mul_mat(
                 ctx0, lw->b,
@@ -1906,7 +1925,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const int64_t n_expert = w_s->ne[0];
         const int64_t n_tokens = cur->ne[2];
         ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
-        s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+        if (ids->ne[1] != 1) {
+            // get_rows takes one row set per token; a single token reads the scales as they are
+            s = ggml_repeat_4d(ctx0, s, 1, n_expert, ids->ne[1], 1);
+        }
         s = ggml_get_rows(ctx0, s, ids);
         res = ggml_mul(ctx0, res, s);
     }
@@ -1919,6 +1941,11 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const float alpha = lora.first->alpha;
         const float rank  = (float) lw->b->ne[0];
         const float scale = alpha ? lora.second * alpha / rank : lora.second;
+
+        if (lora.first->ablate) {
+            res = build_lora_ablate(ctx0, res, lw->b, scale);
+            continue;
+        }
 
         ggml_tensor * ab_cur = ggml_mul_mat_id(
                 ctx0, lw->b,
@@ -2576,6 +2603,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    // batches: a per-expert down scale is a scalar per selected expert, so it can ride on the router weights
+    // instead of a pass over the [n_embd, n_expert_used, n_tokens] outputs (decode keeps the matvec+mul fusion)
+    const bool fold_down_s = down_exps_s && !down_exps_b && !post_exp_norm && !weight_before_ffn &&
+                             cache.slots == nullptr && n_tokens > 16;
+
     // the experts selected by mm_ids, up to the down projection, from the MoE cache if cached
     // ids are the selected experts, for the biases and scales
     auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached) {
@@ -2671,6 +2703,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
 
+                    // gate/up views first, so that the activation is one run of nodes that backends can fuse
+                    ggml_build_forward_expand(gf, cur);
+                    ggml_build_forward_expand(gf, up);
+
                     ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
                     act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
                     if (lb > 0.0f) {
@@ -2727,7 +2763,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
-        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, down_exps_s, mm_ids, cached); // [n_embd, n_expert_used, n_tokens]
+        // prefill: the per-expert down scale goes on the router weights below, not on the [n_embd, n_expert_used, n_tokens] outputs
+        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, fold_down_s ? nullptr : down_exps_s, mm_ids, cached); // [n_embd, n_expert_used, n_tokens]
         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
         cb(experts, "ffn_moe_down", il);
 
@@ -2737,6 +2774,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         return experts;
     };
+
+    if (fold_down_s) {
+        ggml_tensor * s = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, down_exps_s, 1, down_exps_s->ne[0], 1), 1, down_exps_s->ne[0], n_tokens, 1);
+        weights = ggml_mul(ctx0, weights, ggml_get_rows(ctx0, s, selected_experts)); // [1, n_expert_used, n_tokens]
+        cb(weights, "ffn_moe_weights_down_scaled", il);
+    }
 
     ggml_tensor * experts = cache.slots == nullptr ?
         build_experts(cur, selected_experts, nullptr, true) :
@@ -2881,6 +2924,11 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
 
             const float adapter_scale = lora.second;
             const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
+
+            if (lora.first->ablate) {
+                cur = build_lora_ablate(ctx0, cur, lw->b, scale);
+                continue;
+            }
 
             ggml_tensor * inpL_delta = ggml_scale(ctx0, ggml_mul_mat(
                         ctx0, lw->b, // non-transposed lora_b
@@ -3217,19 +3265,38 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        if (kv_rows) {
+        // a per-head relative-position mask (REL_POS_MASK) is n_kv x n_q x n_head (inkling2 at 32K x 512 x 24 heads: ~805 MB f16):
+        // where the backend can, hand flash attention the bias table and the distances instead and let it build the mask per tile
+        ggml_tensor * fa_rel = nullptr;
+        if (!kv_rows && v_mla == nullptr && kq_mask && kq_mask->op == GGML_OP_REL_POS_MASK && n_stream == 1 && q->ne[1] > 8 &&
+            kq_mask->src[2]->type == GGML_TYPE_F16 && kq_mask->src[2]->ne[3] == 1 && ggml_is_contiguous(kq_mask->src[0])) {
+            fa_rel = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask->src[2], kq_scale, hparams.f_max_alibi_bias,
+                                         hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            ggml_flash_attn_ext_set_rel_pos(fa_rel, kq_mask->src[0], kq_mask->src[1], kq_mask->src[3]);
+            ggml_flash_attn_ext_add_sinks(fa_rel, sinks); // supports_op looks at the sinks too
+            if (!sched || !ggml_backend_supports_op(ggml_backend_sched_get_backend(sched, 0), fa_rel)) {
+                fa_rel = nullptr;
+            } else {
+                fa_rel->src[4] = nullptr; // set again below with the other flash attention settings
+            }
+        }
+        if (fa_rel) {
+            cur = fa_rel;
+        } else if (kv_rows) {
             cur = ggml_flash_attn_ext_rows(ctx0, q, k, v, kq_mask, kv_rows, kq_scale, hparams.f_max_alibi_bias,
                                            hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         } else {
             cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                       hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         }
-        res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        {
+            res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
-        ggml_flash_attn_ext_add_sinks(cur, sinks);
-        GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
-        ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
-        ggml_prec_set_acc(cur, GGML_PREC_F32);
+            ggml_flash_attn_ext_add_sinks(cur, sinks);
+            GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+            ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+            ggml_prec_set_acc(cur, GGML_PREC_F32);
+        }
 
         if (v_mla) {
 #if 0
@@ -4497,14 +4564,17 @@ ggml_tensor * llm_graph_context::build_attn(
     //       needs a kv_rows flash attention with a per-head mask (CUDA has none)
     GGML_ASSERT(attn_mask.rows == nullptr);
 
-    // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
-    ggml_tensor * kq_mask = attn_mask.raw;
-    if (kq_mask->type != GGML_TYPE_F32) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
-    }
-    kq_mask = ggml_add(ctx0, kq_b, kq_mask);
-    if (cparams.flash_attn) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+    // a mask per head, in the dense layout of the input mask, which flash attention takes in F16:
+    // kq_b is the bias table [n_rel, n_head, n_tokens], gathered by distance and added to the mask in one op
+    ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+    const ggml_type mask_type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    ggml_tensor * kq_mask;
+    if (kq_b->op == GGML_OP_SUB && kq_b->src[1]->ne[0] == 1 && kq_b->src[1]->ne[1] == kq_b->ne[1] && kq_b->src[1]->ne[2] == kq_b->ne[2] &&
+        kq_b->src[1]->ne[3] == 1 && kq_b->src[1]->type == GGML_TYPE_F32 && ggml_are_same_shape(kq_b, kq_b->src[0])) {
+        // table - per-(head, token) value (inkling2 sinks): subtract in the gather instead of over the whole table
+        kq_mask = ggml_rel_pos_mask_sub(ctx0, kq_b->src[0], kq_b->src[1], rel_pos, attn_mask.raw, mask_type);
+    } else {
+        kq_mask = ggml_rel_pos_mask(ctx0, kq_b, rel_pos, attn_mask.raw, mask_type);
     }
     cb(kq_mask, "kq_mask_rel_pos", il);
 

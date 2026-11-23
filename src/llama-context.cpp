@@ -808,6 +808,10 @@ void llama_context::sched_reserve() {
         res->reset();
     }
 
+    // free the old compute buffers before reserving new ones: a grow-in-place realloc can have both alive at once,
+    // and on a nearly full card the driver then evicts other buffers (KV) to system memory
+    sched.reset();
+
     sched_new({
         /*.max_nodes  =*/ max_nodes,
         /*.parallel   =*/ cparams.pipeline_parallel,
@@ -1482,6 +1486,33 @@ ggml_backend_t llama_context::backend_from_dev(ggml_backend_dev_t dev) const {
         }
     }
     return nullptr;
+}
+
+ggml_tensor * llama_context::get_dflash_ring() const {
+    if (dflash_ring || !model.hparams.dflash_inkling2) {
+        return dflash_ring;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ctx_dflash_ring.reset(ggml_init(params));
+
+    dflash_ring = ggml_new_tensor_2d(ctx_dflash_ring.get(), GGML_TYPE_F32, model.hparams.n_embd, (int64_t) LLAMA_DFLASH_RING*cparams.n_seq_max);
+    ggml_set_name(dflash_ring, "dflash_ring");
+
+    auto * dev  = model.dev_output();
+    auto * buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
+    buf_dflash_ring.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_dflash_ring.get(), buft));
+    GGML_ASSERT(buf_dflash_ring && "failed to allocate the inkling2 draft ring");
+    ggml_backend_buffer_clear(buf_dflash_ring.get(), 0);
+
+    LLAMA_LOG_INFO("%s: %10s inkling2 draft ring size = %8.2f MiB\n", __func__,
+            ggml_backend_buffer_name(buf_dflash_ring.get()), ggml_backend_buffer_get_size(buf_dflash_ring.get())/1024.0/1024.0);
+
+    return dflash_ring;
 }
 
 void llama_context::layer_inp_dev_alloc() {
@@ -3067,6 +3098,7 @@ llm_graph_params llama_context::graph_params(
         /*.layer_inp_src =*/ supports_embd_row() ? cparams.ctx_other->get_layer_inp_dev() : nullptr,
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
         /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
+        /*.dflash_ring   =*/ get_dflash_ring(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

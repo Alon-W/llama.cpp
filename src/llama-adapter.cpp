@@ -219,6 +219,13 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
         }
 
         adapter.alpha = get_kv_f32(llm_kv(LLM_KV_ADAPTER_LORA_ALPHA));
+        {
+            const int id = gguf_find_key(gguf_ctx, "adapter.lora.ablate");
+            adapter.ablate = id >= 0 && gguf_get_kv_type(gguf_ctx, id) == GGUF_TYPE_BOOL && gguf_get_val_bool(gguf_ctx, id);
+            if (adapter.ablate) {
+                LLAMA_LOG_INFO("%s: ablation adapter: applying lora_b as output projections\n", __func__);
+            }
+        }
 
         // parse alora invocation sequence vector
         const auto & key = llm_kv(LLM_KV_ADAPTER_ALORA_INVOCATION_TOKENS);
@@ -376,6 +383,16 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
         }
 
         // save tensor to adapter
+        if (adapter.ablate) {
+            // the projection only reads r: keep one [1, n_embd] column of lora_b (experts share it), skip lora_a
+            if (w.b->type != GGML_TYPE_F32 || w.b->ne[0] != 1) {
+                throw std::runtime_error("ablation adapter tensor '" + name + "' must have an f32 rank-1 lora_b");
+            }
+            ggml_tensor * tensor_b = ggml_new_tensor_2d(dev_ctx, GGML_TYPE_F32, 1, w.b->ne[1]);
+            ggml_set_name(tensor_b, w.b->name);
+            adapter.ab_map[name] = llama_adapter_lora_weight(nullptr, tensor_b);
+            continue;
+        }
         ggml_tensor * tensor_a = ggml_dup_tensor(dev_ctx, w.a);
         ggml_tensor * tensor_b = ggml_dup_tensor(dev_ctx, w.b);
         ggml_set_name(tensor_a, w.a->name);
@@ -403,8 +420,12 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
     {
         std::vector<uint8_t> read_buf;
         auto set_tensor = [&](ggml_tensor * orig, ggml_tensor * dev) {
+            if (dev == nullptr) {
+                return; // ablation adapter: lora_a is not loaded
+            }
             const size_t offs = gguf_get_data_offset(ctx_gguf.get()) + gguf_get_tensor_offset(ctx_gguf.get(), gguf_find_tensor(ctx_gguf.get(), orig->name));
-            const size_t size = ggml_nbytes(orig);
+            // dev is the whole tensor, or for an ablation adapter the leading column of lora_b
+            const size_t size = std::min(ggml_nbytes(orig), ggml_nbytes(dev));
             if (offs + size < offs || offs + size > gguf_file.size()) {
                 throw std::runtime_error(format("LoRA tensor '%s' data is not within the file bounds, file is corrupted or incomplete", orig->name));
             }

@@ -57,6 +57,9 @@ struct llama_hparams_convnext {
     uint32_t n_layer;
 };
 
+// positions of the inkling2 draft ring per sequence (only pos0 - 1 is read: any span past a verify block works)
+#define LLAMA_DFLASH_RING 256
+
 struct llama_hparams {
     // note: use the `_impl` suffix to avoid name conflict between members and getters
     //       for example: n_embd_out() vs n_embd_out_impl
@@ -300,6 +303,11 @@ struct llama_hparams {
     uint32_t n_embd_out_impl = 0;
 
     uint32_t dflash_block_size       = 0;
+
+    // inkling2 DSpark draft: per-row softmax of fuse_weight, [(n_layer + 1) x n_taps], the last row the head's
+    bool     dflash_inkling2         = false;
+    uint32_t dflash_n_taps           = 0;
+    std::array<float, 64> dflash_fuse_alpha = {};
     uint32_t dflash_conv_kernel_size = 0;
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;

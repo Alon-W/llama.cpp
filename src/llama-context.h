@@ -94,6 +94,9 @@ struct llama_context {
     float * get_embeddings_layer_inp(uint32_t lid);
 
     ggml_tensor * get_layer_inp_dev() const { return layer_inp_dev; }
+
+    // inkling2 DSpark draft: rows of the head's fused target features at (seq, pos % LLAMA_DFLASH_RING), allocated on first use
+    ggml_tensor * get_dflash_ring() const;
     ggml_tensor * get_h_nextn_dev()   const { return h_nextn_dev; }
 
     llama_token * get_sampled_tokens() const;
@@ -464,6 +467,10 @@ private:
     ggml_backend_buffer_ptr buf_layer_inp_dev;
     ggml_tensor *           layer_inp_dev = nullptr;
     ggml_backend_dev_t      layer_inp_dev_dev = nullptr;
+
+    mutable ggml_context_ptr        ctx_dflash_ring;
+    mutable ggml_backend_buffer_ptr buf_dflash_ring;
+    mutable ggml_tensor *           dflash_ring = nullptr;
     ggml_backend_t          layer_inp_backend = nullptr;
 
     // ordering with the reader context (no host sync):

@@ -1606,6 +1606,7 @@ struct llama_model_dflash : public llama_model_base {
         BACKBONE_DSV4,
         BACKBONE_DSV41,
         BACKBONE_MISTRAL_LARGE4,
+        BACKBONE_INKLING2,
     };
 
     variant_type  variant  = VARIANT_DFLASH;
@@ -1621,6 +1622,7 @@ struct llama_model_dflash : public llama_model_base {
     void load_tensors_layers_base();
     void load_tensors_layers_dsv4();
     void load_tensors_layers_mistral_large4();
+    void load_tensors_inkling2();
 
     template <bool is_enc>
     struct graph : public llm_graph_context {
@@ -1677,6 +1679,15 @@ struct llama_model_dflash : public llama_model_base {
     // Mistral Large 4 DSpark: dense MLA stages, non-causal, rnn markov head
     struct graph_mistral_large4 : public llm_graph_context {
         graph_mistral_large4(const llm_graph_params & params);
+    };
+
+    // Inkling-2 DSpark: dense stages over context K/V from per-layer fused target features, rnn_hidden head
+    struct graph_inkling2 : public graph_base {
+        graph_inkling2(const llm_graph_params & params);
+
+        ggml_tensor * build_fuse(ggml_tensor * feats, int row, ggml_tensor * norm) const;
+        void build_inject_inkling2();
+        void build_draft_inkling2();
     };
 
     // graph helpers shared by the backbones

@@ -71,6 +71,10 @@ struct llama_adapter_lora {
 
     float alpha;
 
+    // adapter.lora.ablate: every lora_b is a unit direction r and lora_a = -r^T W (abliteration);
+    // applied as an exact projection of the output, x - r (r . x), instead of two extra matmuls
+    bool ablate = false;
+
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 

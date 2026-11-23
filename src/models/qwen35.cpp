@@ -662,7 +662,32 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    // LLAMA_MTP_HEAD_TOPK=K: the draft head scores only the first K vocab rows (BPE ids ~ frequency order).
+    // A prefix is a zero-copy view, so the draft reads K/n_vocab of the head. Pruned ids get -1e4, so the
+    // draft never proposes them; the target still verifies against the full vocab, so output is unchanged.
+    // LLAMA_MTP_HEAD_TOPK_MATCH (optional): only models whose general.name contains this string are pruned,
+    // so one router image can prune one Qwen3.5 model and leave another alone.
+    const int64_t topk = [&]() -> int64_t {
+        const char * e = getenv("LLAMA_MTP_HEAD_TOPK");
+        const char * m = getenv("LLAMA_MTP_HEAD_TOPK_MATCH");
+        if (!e || (m && model.name.find(m) == std::string::npos)) { return 0; }
+        return atoll(e);
+    }();
+    if (topk > 0 && topk < head_w->ne[1] && loras->empty()) {
+        const int64_t n_vocab_h = head_w->ne[1];
+        ggml_tensor * cur_mm = build_hadamard_input(head_w, cur);
+        ggml_tensor * w_k = ggml_view_2d(ctx0, head_w, head_w->ne[0], topk, head_w->nb[1], 0);
+        cur = ggml_mul_mat(ctx0, w_k, cur_mm);
+        if (head_s) {
+            cur = ggml_mul(ctx0, cur, ggml_view_1d(ctx0, head_s, topk, 0));
+        }
+        // shift up, zero-pad the tail, shift back: kept logits unchanged, pruned = -1e4
+        cur = ggml_scale_bias(ctx0, cur, 1.0f, 1e4f);
+        cur = ggml_pad(ctx0, cur, n_vocab_h - topk, 0, 0, 0);
+        cur = ggml_scale_bias(ctx0, cur, 1.0f, -1e4f);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

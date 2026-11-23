@@ -52,6 +52,23 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
     }
 
+    // Inkling-2 DSpark: per-layer fused target features instead of an fc encoder, rnn_hidden head
+    {
+        std::vector<float> alpha;
+        if (ml.get_arr(LLM_KV_DFLASH_FUSE_ALPHA, alpha, false)) {
+            const size_t n_taps = target_layer_ids.size();
+            if (alpha.size() != (hparams.n_layer() + 1)*n_taps || alpha.size() > hparams.dflash_fuse_alpha.size()) {
+                throw std::runtime_error("DFlash fuse_alpha: expected (n_layer + 1) x n_taps values");
+            }
+            std::copy(alpha.begin(), alpha.end(), hparams.dflash_fuse_alpha.begin());
+            hparams.dflash_n_taps   = (uint32_t) n_taps;
+            hparams.dflash_inkling2 = true;
+            backbone = BACKBONE_INKLING2;
+            // the plain DFlash driver reads the drafts the graph's head produces
+            variant  = VARIANT_DFLASH;
+        }
+    }
+
     hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
 
     std::string layers;
@@ -100,6 +117,11 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         LLAMA_LOG_INFO("%s: DFlash using d2t mapping (draft_vocab_size = %lld)\n", __func__, (long long) n_vocab_draft);
     }
 
+    if (backbone == BACKBONE_INKLING2) {
+        load_tensors_inkling2();
+        return;
+    }
+
     switch (variant) {
         case VARIANT_DSPARK:   load_tensors_dspark(n_vocab_draft); break;
         case VARIANT_DFLASH2:  load_tensors_dflash2();             break;
@@ -122,6 +144,7 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         case BACKBONE_DSV4:
         case BACKBONE_DSV41:          load_tensors_layers_dsv4();           break;
         case BACKBONE_MISTRAL_LARGE4: load_tensors_layers_mistral_large4(); break;
+        case BACKBONE_INKLING2:       break;
     }
 }
 
@@ -540,6 +563,7 @@ std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const ll
                 case BACKBONE_DSV4:           return std::make_unique<graph_dsv4>(params);
                 case BACKBONE_DSV41:          return std::make_unique<graph_dsv41>(params);
                 case BACKBONE_MISTRAL_LARGE4: return std::make_unique<graph_mistral_large4>(params);
+                case BACKBONE_INKLING2:       return std::make_unique<graph_inkling2>(params);
             }
             switch (variant) {
                 case VARIANT_DFLASH:   return std::make_unique<graph_dflash>(params);

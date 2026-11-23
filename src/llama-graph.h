@@ -864,6 +864,7 @@ struct llm_graph_params {
     ggml_tensor * layer_inp_src = nullptr; // ctx_other's layer input device buffer (read)
     ggml_tensor * h_nextn_dev   = nullptr; // own h_nextn device buffer (write)
     ggml_tensor * h_nextn_src   = nullptr; // ctx_state_src's h_nextn device buffer (read)
+    ggml_tensor * dflash_ring   = nullptr; // own inkling2 draft ring: the head's fused target features per (seq, pos % ring)
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -961,6 +962,7 @@ struct llm_graph_params {
             layer_inp_src == other.layer_inp_src &&
             h_nextn_dev   == other.h_nextn_dev   &&
             h_nextn_src   == other.h_nextn_src   &&
+            dflash_ring   == other.dflash_ring   &&
             model == other.model &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1140,6 +1142,7 @@ struct llm_graph_context {
     ggml_tensor * layer_inp_src;
     ggml_tensor * h_nextn_dev;
     ggml_tensor * h_nextn_src;
+    ggml_tensor * dflash_ring;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
