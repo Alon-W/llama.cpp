@@ -415,6 +415,11 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_REL_POS_MASK,
+        GGML_OP_DEPTH_MIX,
+        GGML_OP_LOOP_GATE,
+        GGML_OP_LOOP_APPLY,
+        GGML_OP_DEPTH_SCORES,
 
         GGML_OP_UNARY,
 
@@ -2283,6 +2288,15 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // per-head relative-position bias built inside the attention instead of a [n_kv, n_q, n_head] mask:
+    // the mask used is f16((table[rel_pos[c, i], h, i] - sub[0, h, i]) + mask[c, i]), the values of ggml_rel_pos_mask_sub
+    // table: F32 [n_rel, n_head, n_q], rel_pos: I32 [n_kv, n_q], sub: F32 [1, n_head, n_q] or NULL, all contiguous; mask: one head
+    GGML_API void ggml_flash_attn_ext_set_rel_pos(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * rel_pos,
+            struct ggml_tensor * sub);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,
@@ -2517,6 +2531,82 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // per-head attention mask from a relative-position bias table, in one pass
+    // table:   [n_rel, n_head, n_tokens]                 f32: bias of each distance bucket, head and query
+    // rel_pos: [n_kv,  n_tokens]                         i32: distance bucket of each cell for each query, in [0, n_rel)
+    // mask:    [n_kv,  n_tokens/n_stream, 1, n_stream]   f16 or f32: the causal mask
+    // res:     [n_kv,  n_tokens/n_stream, n_head, n_stream] of the given type (f16 or f32)
+    //
+    // res[c, i, h, s] = table[rel_pos[c, t], h, t] + mask[c, i, 0, s], t = s*(n_tokens/n_stream) + i
+    //
+    GGML_API struct ggml_tensor * ggml_rel_pos_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * rel_pos,
+            struct ggml_tensor  * mask,
+            enum ggml_type        type);
+
+    // same, minus a value per head and token: res[c, i, h, s] = (table[rel_pos[c, t], h, t] - sub[0, h, t]) + mask[c, i, 0, s]
+    // sub: [1, n_head, n_tokens] f32 (folds a subtraction from the whole table into the gather)
+    GGML_API struct ggml_tensor * ggml_rel_pos_mask_sub(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * sub,
+            struct ggml_tensor  * rel_pos,
+            struct ggml_tensor  * mask,
+            enum ggml_type        type);
+
+    // attention over depth (inkling2 block residuals), in one pass
+    // earlier: [n, K-1, T]  f32: rms-normed earlier states, K-1 >= 1
+    // cur:     [n, T]       f32: the current state, rms-normed here with eps
+    // query:   [n, nq]      f32
+    // res:     [n, nq, T]   f32: res[:, q, t] = sum_k softmax_k(scale * S_k.query_q) * S_k, S = [earlier[:, :, t]..., rms_norm(cur[:, t])]
+    GGML_API struct ggml_tensor * ggml_depth_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * earlier,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * query,
+            float                 eps,
+            float                 scale);
+
+    // the scores of ggml_depth_mix as their own op, so that a backend can spread the dots over the states
+    // res: [K1 + 2, nq, T] f32: res[k, q, t] = scale * S_k.query_q for k <= K1 (S as in ggml_depth_mix), res[K1 + 1, q, t] = the rms scale of cur
+    GGML_API struct ggml_tensor * ggml_depth_scores(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * earlier,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * query,
+            float                 eps,
+            float                 scale);
+
+    // ggml_depth_mix from precomputed ggml_depth_scores: softmax over k and the weighted sum only
+    GGML_API struct ggml_tensor * ggml_depth_mix_scored(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * earlier,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * scores);
+
+    // low-rank gate of a loop controller (inkling2 control()), in one pass
+    // cur, msg: [n, T] f32; w: [2n, r] f32
+    // res:      [r, T] f32 = w^T concat(rms_norm(cur), rms_norm(msg)), both norms with eps
+    GGML_API struct ggml_tensor * ggml_loop_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * msg,
+            struct ggml_tensor  * w,
+            float                 eps);
+
+    // apply a loop controller's gate (inkling2 control()), in one pass
+    // cur, msg: [n, T] f32; gate: [r, T] f32; w_gain, w_forget: [r, n] f32
+    // res:      [n, T] f32 = cur - tanh(w_forget^T gate)*cur + tanh(w_gain^T gate)*msg
+    GGML_API struct ggml_tensor * ggml_loop_apply(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * msg,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * w_gain,
+            struct ggml_tensor  * w_forget);
 
     // custom operators
 

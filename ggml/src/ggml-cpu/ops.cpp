@@ -9451,6 +9451,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
 
+    GGML_ASSERT(dst->src[6] == nullptr && "ggml_flash_attn_ext_set_rel_pos is not supported on CPU");
+
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
     GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
@@ -12526,6 +12528,203 @@ void ggml_compute_forward_lightning_indexer(
                 // apply mask
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
+        }
+    }
+}
+
+void ggml_compute_forward_rel_pos_mask(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * table   = dst->src[0];
+    const ggml_tensor * rel_pos = dst->src[1];
+    const ggml_tensor * mask    = dst->src[2];
+    const ggml_tensor * sub     = dst->src[3]; // optional [1, n_head, n_tokens]
+
+    const int64_t n_kv   = dst->ne[0];
+    const int64_t n_q    = dst->ne[1];
+    const int64_t n_head = dst->ne[2];
+    const int64_t n_rel  = table->ne[0];
+    const int64_t n_rows = n_q*dst->ne[3];
+
+    for (int64_t ir = params->ith; ir < n_rows; ir += params->nth) {
+        const int64_t i = ir % n_q;
+        const int64_t s = ir / n_q;
+        const int64_t t = s*n_q + i;
+
+        const int32_t * pos = (const int32_t *) ((const char *) rel_pos->data + t*rel_pos->nb[1]);
+        const char * m_row  = (const char *) mask->data + i*mask->nb[1] + s*mask->nb[3];
+
+        for (int64_t h = 0; h < n_head; ++h) {
+            const char * t_col = (const char *) table->data + h*table->nb[1] + t*table->nb[2];
+            char * d_row = (char *) dst->data + i*dst->nb[1] + h*dst->nb[2] + s*dst->nb[3];
+            const float sv = sub ? *(const float *) ((const char *) sub->data + h*sub->nb[1] + t*sub->nb[2]) : 0.0f;
+            for (int64_t c = 0; c < n_kv; ++c) {
+                const int32_t p = pos[c];
+                GGML_ASSERT(p >= 0 && p < n_rel);
+                const float m = mask->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) m_row)[c]) : ((const float *) m_row)[c];
+                const float tv = *(const float *) (t_col + p*table->nb[0]);
+                const float v  = (sub ? tv - sv : tv) + m;
+                if (dst->type == GGML_TYPE_F16) {
+                    ((ggml_fp16_t *) d_row)[c] = GGML_CPU_FP32_TO_FP16(v);
+                } else {
+                    ((float *) d_row)[c] = v;
+                }
+            }
+        }
+    }
+}
+
+// inkling2 depth attention, loop controller gate and apply (reference loops)
+
+static float ggml_cpu_rms_scale(const float * x, int64_t n, float eps) {
+    ggml_float sum = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        sum += (ggml_float) x[i] * x[i];
+    }
+    return 1.0f/sqrtf((float) (sum/n) + eps);
+}
+
+// scores of one token: w[k] = scale * S_k.query_q for k <= K1, returns the rms scale of cur
+static float ggml_cpu_depth_logits(const ggml_tensor * earlier, const ggml_tensor * cur, const ggml_tensor * query,
+        int64_t t, int64_t q, float eps, float scale, float * w) {
+    const int64_t n  = cur->ne[0];
+    const int64_t K1 = earlier->ne[1];
+    const float * c  = (const float *) ((const char *) cur->data + t*cur->nb[1]);
+    const float   rs = ggml_cpu_rms_scale(c, n, eps);
+    const float * qv = (const float *) ((const char *) query->data + q*query->nb[1]);
+    for (int64_t k = 0; k <= K1; ++k) {
+        ggml_float d = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            const float s = k < K1 ? *(const float *) ((const char *) earlier->data + i*sizeof(float) + k*earlier->nb[1] + t*earlier->nb[2]) : c[i]*rs;
+            d += (ggml_float) s*qv[i];
+        }
+        w[k] = (float) d*scale;
+    }
+    return rs;
+}
+
+void ggml_compute_forward_depth_scores(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * earlier = dst->src[0];
+    const ggml_tensor * cur     = dst->src[1];
+    const ggml_tensor * query   = dst->src[2];
+
+    const float eps   = ggml_get_op_params_f32(dst, 0);
+    const float scale = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t K1 = earlier->ne[1];
+    const int64_t nq = query->ne[1];
+    const int64_t T  = cur->ne[1];
+
+    for (int64_t r = params->ith; r < nq*T; r += params->nth) {
+        const int64_t q = r % nq, t = r / nq;
+        float * out = (float *) ((char *) dst->data + q*dst->nb[1] + t*dst->nb[2]);
+        out[K1 + 1] = ggml_cpu_depth_logits(earlier, cur, query, t, q, eps, scale, out);
+    }
+}
+
+void ggml_compute_forward_depth_mix(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * earlier = dst->src[0];
+    const ggml_tensor * cur     = dst->src[1];
+    const ggml_tensor * query   = dst->src[2];
+    const ggml_tensor * scores  = dst->src[3]; // optional: precomputed ggml_depth_scores
+
+    const float eps   = ggml_get_op_params_f32(dst, 0);
+    const float scale = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t n  = cur->ne[0];
+    const int64_t K1 = earlier->ne[1];
+    const int64_t nq = query->ne[1];
+    const int64_t T  = cur->ne[1];
+
+    std::vector<float> w(K1 + 1);
+    for (int64_t t = params->ith; t < T; t += params->nth) {
+        const float * c  = (const float *) ((const char *) cur->data + t*cur->nb[1]);
+        for (int64_t q = 0; q < nq; ++q) {
+            float rs;
+            if (scores) {
+                const float * sc = (const float *) ((const char *) scores->data + q*scores->nb[1] + t*scores->nb[2]);
+                std::copy(sc, sc + K1 + 1, w.begin());
+                rs = sc[K1 + 1];
+            } else {
+                rs = ggml_cpu_depth_logits(earlier, cur, query, t, q, eps, scale, w.data());
+            }
+            auto state = [&](int64_t k, int64_t i) -> float {
+                return k < K1 ? *(const float *) ((const char *) earlier->data + i*sizeof(float) + k*earlier->nb[1] + t*earlier->nb[2]) : c[i]*rs;
+            };
+            float mx = -INFINITY;
+            for (int64_t k = 0; k <= K1; ++k) {
+                mx = std::max(mx, w[k]);
+            }
+            float sum = 0.0f;
+            for (int64_t k = 0; k <= K1; ++k) {
+                w[k] = expf(w[k] - mx);
+                sum += w[k];
+            }
+            float * out = (float *) ((char *) dst->data + q*dst->nb[1] + t*dst->nb[2]);
+            for (int64_t i = 0; i < n; ++i) {
+                float o = 0.0f;
+                for (int64_t k = 0; k <= K1; ++k) {
+                    o += w[k]*state(k, i);
+                }
+                out[i] = o/sum;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_loop_gate(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * cur = dst->src[0];
+    const ggml_tensor * msg = dst->src[1];
+    const ggml_tensor * w   = dst->src[2];
+
+    const float eps = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t n = cur->ne[0];
+    const int64_t r = w->ne[1];
+    const int64_t T = cur->ne[1];
+
+    for (int64_t t = 0; t < T; ++t) {
+        const float * c  = (const float *) ((const char *) cur->data + t*cur->nb[1]);
+        const float * m  = (const float *) ((const char *) msg->data + t*msg->nb[1]);
+        const float   rc = ggml_cpu_rms_scale(c, n, eps);
+        const float   rm = ggml_cpu_rms_scale(m, n, eps);
+        float * out = (float *) ((char *) dst->data + t*dst->nb[1]);
+        for (int64_t j = params->ith; j < r; j += params->nth) {
+            const float * wr = (const float *) ((const char *) w->data + j*w->nb[1]);
+            ggml_float d = 0.0;
+            for (int64_t i = 0; i < n; ++i) {
+                d += (ggml_float) wr[i]*c[i]*rc + (ggml_float) wr[n + i]*m[i]*rm;
+            }
+            out[j] = (float) d;
+        }
+    }
+}
+
+void ggml_compute_forward_loop_apply(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * cur      = dst->src[0];
+    const ggml_tensor * msg      = dst->src[1];
+    const ggml_tensor * gate     = dst->src[2];
+    const ggml_tensor * w_gain   = dst->src[3];
+    const ggml_tensor * w_forget = dst->src[4];
+
+    const int64_t n = cur->ne[0];
+    const int64_t r = gate->ne[0];
+    const int64_t T = cur->ne[1];
+
+    for (int64_t t = 0; t < T; ++t) {
+        const float * c = (const float *) ((const char *) cur->data  + t*cur->nb[1]);
+        const float * m = (const float *) ((const char *) msg->data  + t*msg->nb[1]);
+        const float * g = (const float *) ((const char *) gate->data + t*gate->nb[1]);
+        float * out = (float *) ((char *) dst->data + t*dst->nb[1]);
+        for (int64_t e = params->ith; e < n; e += params->nth) {
+            const float * wg = (const float *) ((const char *) w_gain->data   + e*w_gain->nb[1]);
+            const float * wf = (const float *) ((const char *) w_forget->data + e*w_forget->nb[1]);
+            ggml_float dg = 0.0, df = 0.0;
+            for (int64_t j = 0; j < r; ++j) {
+                dg += (ggml_float) wg[j]*g[j];
+                df += (ggml_float) wf[j]*g[j];
+            }
+            out[e] = c[e] - tanhf((float) df)*c[e] + tanhf((float) dg)*m[e];
         }
     }
 }
