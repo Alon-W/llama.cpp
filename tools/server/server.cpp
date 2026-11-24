@@ -704,6 +704,8 @@ static int server_run_instance(common_params & params, server_role & role, commo
         return 1;
     }
 
+    ctx_server.slots_persist_restore();
+
     routes.update_meta(ctx_server);
     ctx_http.is_ready.store(true);
 
@@ -741,6 +743,8 @@ static int server_run_instance(common_params & params, server_role & role, commo
 
     // this call blocks the main thread until queue_tasks.terminate() is called
     ctx_server.start_loop();
+
+    ctx_server.slots_persist_save();
 
     clean_up();
     ctx_http.join();

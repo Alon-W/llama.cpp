@@ -78,6 +78,10 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // --slot-persist: restore saved slots before serving, save them after the task loop stops
+    void slots_persist_restore();
+    void slots_persist_save();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;

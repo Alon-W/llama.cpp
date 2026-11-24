@@ -1221,6 +1221,173 @@ private:
 
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
+    // a slot's tokens, llama state, context checkpoints and draft state -> filepath
+    bool slot_save_file(server_slot & slot, const std::string & filepath, size_t & n_bytes, std::string & err, error_type & err_type) {
+        std::vector<char> packed;
+        try {
+            packed = slot.prompt.tokens.serialize();
+        } catch (const std::exception & e) {
+            err = e.what();
+            err_type = ERROR_TYPE_NOT_SUPPORTED;
+            return false;
+        }
+        err_type = ERROR_TYPE_SERVER;
+
+        GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+        const size_t nwrite = llama_state_seq_save_file(
+            ctx_tgt, filepath.c_str(), slot.id,
+            reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+        if (nwrite == 0) {
+            err = "Unable to save slot";
+            return false;
+        }
+
+        size_t nwrite_ckpt = 0;
+        if (!save_slot_checkpoints(filepath, slot, nwrite_ckpt)) {
+            err = "Unable to save slot: incomplete context checkpoints";
+            return false;
+        }
+
+        size_t nwrite_dft = 0;
+        if (!save_slot_draft(filepath, slot, nwrite_dft)) {
+            err = "Unable to save slot: incomplete draft state";
+            return false;
+        }
+
+        n_bytes = nwrite + nwrite_ckpt + nwrite_dft;
+        return true;
+    }
+
+    // inverse of slot_save_file; on failure the slot is left empty
+    bool slot_restore_file(server_slot & slot, const std::string & filepath, size_t & n_bytes, std::string & err) {
+        size_t nread = 0;
+        try {
+            size_t n_packed = 0;
+            llama_tokens packed;
+            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, nullptr, 0, &n_packed);
+            if (nread != 0) {
+                packed.resize(std::max<size_t>(1, n_packed));
+                nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, packed.data(), packed.size(), &n_packed);
+            }
+            if (nread == 0) {
+                throw std::runtime_error("No available space in KV cache or invalid slot save file");
+            }
+            packed.resize(n_packed);
+
+            server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+
+            if (restored.size() > (size_t) slot.n_ctx) {
+                throw std::runtime_error("Restored prompt does not fit in the slot context");
+            }
+
+            if (!restored.validate(ctx_tgt)) {
+                throw std::runtime_error("Invalid tokens in slot save file");
+            }
+
+            slot.prompt.clear();
+            slot.prompt.tokens = std::move(restored);
+        } catch (const std::exception & e) {
+            slot.prompt_clear();
+            err = std::string("Unable to restore slot: ") + e.what();
+            return false;
+        }
+
+        // nread is the end offset of the llama state payload within the file
+        const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, slot);
+        const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, slot);
+
+        n_bytes = nread + nread_ckpt + nread_dft;
+        return true;
+    }
+
+    // --slot-persist: one file per slot, named by alias, model file and context size, so a changed entry never restores stale state
+    std::string slot_persist_path(const server_slot & slot) const {
+        const std::string alias = params_base.model_alias.empty() ? std::string("model") : *params_base.model_alias.begin();
+        const std::string stem  = std::filesystem::path(params_base.model.path).stem().string();
+        std::string name = string_format("%s__%s__c%d-slot%d.bin", alias.c_str(), stem.c_str(), slot.n_ctx, slot.id);
+        for (char & c : name) {
+            if (!(isalnum((unsigned char) c) || c == '.' || c == '_' || c == '-')) {
+                c = '_';
+            }
+        }
+        return params_base.slot_save_path + name;
+    }
+
+    // called before the task loop starts: no request can touch the slots yet
+    void slots_persist_restore() {
+        if (!params_base.slot_persist || params_base.slot_save_path.empty()) {
+            return;
+        }
+        for (auto & slot : slots) {
+            const std::string path = slot_persist_path(slot);
+            if (!std::filesystem::exists(path)) {
+                continue;
+            }
+            const int64_t t0 = ggml_time_us();
+            size_t n_bytes = 0;
+            std::string err;
+            if (slot_restore_file(slot, path, n_bytes, err)) {
+                SRV_INF("slot persist: restored slot %d (%zu tokens, %.1f MiB) in %.0f ms\n", slot.id, slot.prompt.tokens.size(),
+                        n_bytes / 1048576.0, (ggml_time_us() - t0) / 1000.0);
+            } else {
+                SRV_WRN("slot persist: slot %d not restored: %s\n", slot.id, err.c_str());
+            }
+        }
+    }
+
+    // called after the task loop has stopped: nothing runs on the slots any more
+    void slots_persist_save() {
+        if (!params_base.slot_persist || params_base.slot_save_path.empty() || ctx_tgt == nullptr) {
+            return;
+        }
+        // a slot often ends on a short follow-up while the long (agent) context sits in the RAM prompt cache:
+        // put the longest cached context back into the slot first, so that one is what gets saved
+        if (prompt_cache) {
+            for (auto & slot : slots) {
+                const server_prompt_cache_state * best = nullptr;
+                for (const auto & st : prompt_cache->states) {
+                    if (st.prompt.n_tokens() > (best ? best->prompt.n_tokens() : slot.prompt.n_tokens())) {
+                        best = &st;
+                    }
+                }
+                if (best == nullptr || best->prompt.n_tokens() < 1024) {
+                    continue;
+                }
+                const server_tokens target = best->prompt.tokens.clone();
+                const auto lora = best->prompt.lora;
+                const int n_short = slot.prompt.n_tokens();
+                slot.prompt_clear();
+                if (slot.prompt_load(*prompt_cache, target, lora)) {
+                    SRV_INF("slot persist: slot %d takes the cached %d-token context instead of its %d-token prompt\n", slot.id, slot.prompt.n_tokens(), n_short);
+                }
+            }
+        }
+        for (auto & slot : slots) {
+            if (slot.prompt.tokens.size() == 0) {
+                continue;
+            }
+            const std::string path = slot_persist_path(slot);
+            // a short prompt is cheap to process again: it never replaces a saved (likely long, agent) context
+            if (slot.prompt.tokens.size() < 1024 && std::filesystem::exists(path)) {
+                SRV_INF("slot persist: slot %d kept the saved file (current prompt only %zu tokens)\n", slot.id, slot.prompt.tokens.size());
+                continue;
+            }
+            const std::string tmp  = path + ".tmp";
+            const int64_t t0 = ggml_time_us();
+            size_t n_bytes = 0;
+            std::string err;
+            error_type err_type;
+            // write to a temp file and rename, so a crash mid-write never leaves a half file to restore
+            if (slot_save_file(slot, tmp, n_bytes, err, err_type) && std::rename(tmp.c_str(), path.c_str()) == 0) {
+                SRV_INF("slot persist: saved slot %d (%zu tokens, %.1f MiB) in %.0f ms\n", slot.id, slot.prompt.tokens.size(),
+                        n_bytes / 1048576.0, (ggml_time_us() - t0) / 1000.0);
+            } else {
+                std::remove(tmp.c_str());
+                SRV_WRN("slot persist: slot %d not saved: %s\n", slot.id, err.c_str());
+            }
+        }
+    }
+
     bool load_model(common_params & params) {
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
@@ -3194,32 +3361,11 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    std::vector<char> packed;
-                    try {
-                        packed = slot->prompt.tokens.serialize();
-                    } catch (const std::exception & err) {
-                        send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
-                        break;
-                    }
-
-                    GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-                    const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, filepath.c_str(), slot->id,
-                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
-                    if (nwrite == 0) {
-                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
-                        break;
-                    }
-
-                    size_t nwrite_ckpt = 0;
-                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
-                        send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
-                        break;
-                    }
-
-                    size_t nwrite_dft = 0;
-                    if (!save_slot_draft(filepath, *slot, nwrite_dft)) {
-                        send_error(task, "Unable to save slot: incomplete draft state", ERROR_TYPE_SERVER);
+                    size_t n_bytes = 0;
+                    std::string err;
+                    error_type err_type = ERROR_TYPE_SERVER;
+                    if (!slot_save_file(*slot, filepath, n_bytes, err, err_type)) {
+                        send_error(task, err, err_type);
                         break;
                     }
 
@@ -3232,7 +3378,7 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite + nwrite_ckpt + nwrite_dft;
+                    res->n_bytes  = n_bytes;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -3256,41 +3402,12 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    size_t nread = 0;
-                    try {
-                        size_t n_packed = 0;
-                        llama_tokens packed;
-                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
-                        if (nread != 0) {
-                            packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
-                        }
-                        if (nread == 0) {
-                            throw std::runtime_error("No available space in KV cache or invalid slot save file");
-                        }
-                        packed.resize(n_packed);
-
-                        server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
-
-                        if (restored.size() > (size_t) slot->n_ctx) {
-                            throw std::runtime_error("Restored prompt does not fit in the slot context");
-                        }
-
-                        if (!restored.validate(ctx_tgt)) {
-                            throw std::runtime_error("Invalid tokens in slot save file");
-                        }
-
-                        slot->prompt.clear();
-                        slot->prompt.tokens = std::move(restored);
-                    } catch (const std::exception & err) {
-                        slot->prompt_clear();
-                        send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+                    size_t n_bytes = 0;
+                    std::string err;
+                    if (!slot_restore_file(*slot, filepath, n_bytes, err)) {
+                        send_error(task, err, ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-
-                    // nread is the end offset of the llama state payload within the file
-                    const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
-                    const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, *slot);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -3301,7 +3418,7 @@ private:
                     res->filename = filename;
                     res->is_save  = false;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nread + nread_ckpt + nread_dft;
+                    res->n_bytes  = n_bytes;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -5163,6 +5280,14 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+void server_context::slots_persist_restore() {
+    impl->slots_persist_restore();
+}
+
+void server_context::slots_persist_save() {
+    impl->slots_persist_save();
 }
 
 llama_context * server_context::get_llama_context() const {

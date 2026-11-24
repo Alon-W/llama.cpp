@@ -730,6 +730,7 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
+    bool        slot_persist = false; // save slots to slot_save_path at exit and restore them at load
     std::string media_path; // path to directory for loading media files
     bool media_allow_private_urls = false; // allow http(s) media URLs on local or private addresses
 
