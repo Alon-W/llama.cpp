@@ -3315,6 +3315,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     auto const &rm_iq_int = [](uint32_t i) { return i == 0 ? 8u : 4u; };
     // IQ2/IQ3 MMVQ: 2 rows for a single column, 4 for batches (benched on RDNA2)
     auto const &rm_iq2_int = [](uint32_t i) { return i == 0 ? 2u : 4u; };
+    // sweep knob: GGML_VK_RM1_<TYPE>=rows overrides the single-column MMVQ rows per workgroup for that type
+    auto const &rm_env = [](const char * type, uint32_t i, uint32_t def) -> uint32_t {
+        if (i != 0) { return def; }
+        const char * e = getenv((std::string("GGML_VK_RM1_") + type).c_str());
+        return e ? (uint32_t) atoi(e) : def;
+    };
     if (device->vendor_id == VK_VENDOR_ID_AMD) {
         if (device->architecture == AMD_GCN) {
             rm_stdq = 2;
@@ -3465,14 +3471,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     {GGML_TYPE_Q4_K,   "mul_mat_vec_q4_k_q8_1_f32",   arr_dmmv_q4_k_q8_1_f32_len[reduc],   arr_dmmv_q4_k_q8_1_f32_data[reduc],   rm_kq_int},
                     {GGML_TYPE_Q5_K,   "mul_mat_vec_q5_k_q8_1_f32",   arr_dmmv_q5_k_q8_1_f32_len[reduc],   arr_dmmv_q5_k_q8_1_f32_data[reduc],   rm_kq_int},
                     {GGML_TYPE_Q6_K,   "mul_mat_vec_q6_k_q8_1_f32",   arr_dmmv_q6_k_q8_1_f32_len[reduc],   arr_dmmv_q6_k_q8_1_f32_data[reduc],   rm_kq_int},
-                    {GGML_TYPE_IQ1_S,  "mul_mat_vec_iq1_s_q8_1_f32",  arr_dmmv_iq1_s_q8_1_f32_len[reduc],  arr_dmmv_iq1_s_q8_1_f32_data[reduc],  rm_iq_int(i)},
-                    {GGML_TYPE_IQ1_M,  "mul_mat_vec_iq1_m_q8_1_f32",  arr_dmmv_iq1_m_q8_1_f32_len[reduc],  arr_dmmv_iq1_m_q8_1_f32_data[reduc],  rm_iq_int(i)},
+                    {GGML_TYPE_IQ1_S,  "mul_mat_vec_iq1_s_q8_1_f32",  arr_dmmv_iq1_s_q8_1_f32_len[reduc],  arr_dmmv_iq1_s_q8_1_f32_data[reduc],  rm_env("IQ1_S", i, rm_iq_int(i))},
+                    {GGML_TYPE_IQ1_M,  "mul_mat_vec_iq1_m_q8_1_f32",  arr_dmmv_iq1_m_q8_1_f32_len[reduc],  arr_dmmv_iq1_m_q8_1_f32_data[reduc],  rm_env("IQ1_M", i, rm_iq_int(i))},
                     {GGML_TYPE_IQ4_XS, "mul_mat_vec_iq4_xs_q8_1_f32", arr_dmmv_iq4_xs_q8_1_f32_len[reduc], arr_dmmv_iq4_xs_q8_1_f32_data[reduc], rm_stdq_int},
-                    {GGML_TYPE_IQ2_XXS, "mul_mat_vec_iq2_xxs_q8_1_f32", arr_dmmv_iq2_xxs_q8_1_f32_len[reduc], arr_dmmv_iq2_xxs_q8_1_f32_data[reduc], rm_iq2_int(i)},
-                    {GGML_TYPE_IQ2_XS,  "mul_mat_vec_iq2_xs_q8_1_f32",  arr_dmmv_iq2_xs_q8_1_f32_len[reduc],  arr_dmmv_iq2_xs_q8_1_f32_data[reduc],  rm_iq2_int(i)},
-                    {GGML_TYPE_IQ2_S,   "mul_mat_vec_iq2_s_q8_1_f32",   arr_dmmv_iq2_s_q8_1_f32_len[reduc],   arr_dmmv_iq2_s_q8_1_f32_data[reduc],   rm_iq2_int(i)},
-                    {GGML_TYPE_IQ3_XXS, "mul_mat_vec_iq3_xxs_q8_1_f32", arr_dmmv_iq3_xxs_q8_1_f32_len[reduc], arr_dmmv_iq3_xxs_q8_1_f32_data[reduc], rm_iq2_int(i)},
-                    {GGML_TYPE_IQ3_S,   "mul_mat_vec_iq3_s_q8_1_f32",   arr_dmmv_iq3_s_q8_1_f32_len[reduc],   arr_dmmv_iq3_s_q8_1_f32_data[reduc],   rm_iq2_int(i)},
+                    {GGML_TYPE_IQ2_XXS, "mul_mat_vec_iq2_xxs_q8_1_f32", arr_dmmv_iq2_xxs_q8_1_f32_len[reduc], arr_dmmv_iq2_xxs_q8_1_f32_data[reduc], rm_env("IQ2_XXS", i, rm_iq2_int(i))},
+                    {GGML_TYPE_IQ2_XS,  "mul_mat_vec_iq2_xs_q8_1_f32",  arr_dmmv_iq2_xs_q8_1_f32_len[reduc],  arr_dmmv_iq2_xs_q8_1_f32_data[reduc],  rm_env("IQ2_XS", i, rm_iq2_int(i))},
+                    {GGML_TYPE_IQ2_S,   "mul_mat_vec_iq2_s_q8_1_f32",   arr_dmmv_iq2_s_q8_1_f32_len[reduc],   arr_dmmv_iq2_s_q8_1_f32_data[reduc],   rm_env("IQ2_S", i, rm_iq2_int(i))},
+                    {GGML_TYPE_IQ3_XXS, "mul_mat_vec_iq3_xxs_q8_1_f32", arr_dmmv_iq3_xxs_q8_1_f32_len[reduc], arr_dmmv_iq3_xxs_q8_1_f32_data[reduc], rm_env("IQ3_XXS", i, rm_iq2_int(i))},
+                    {GGML_TYPE_IQ3_S,   "mul_mat_vec_iq3_s_q8_1_f32",   arr_dmmv_iq3_s_q8_1_f32_len[reduc],   arr_dmmv_iq3_s_q8_1_f32_data[reduc],   rm_env("IQ3_S", i, rm_iq2_int(i))},
                 };
 
                 const bool use_four_rows = is_rdna3_or_4 && i >= 4;
