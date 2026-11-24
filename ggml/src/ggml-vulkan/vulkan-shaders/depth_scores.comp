@@ -1,0 +1,94 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Scores of the attention over depth, one workgroup per (state, token):
+//   dst[k, q, t] = scale * S_k . query_q  for k <= K1,  S_k = earlier[:, k, t] (k < K1), rms_norm(cur[:, t]) (k = K1)
+//   dst[K1 + 1, q, t] = rms scale of cur[:, t]
+// The dots of different states run on different compute units; depth_mix_scored does the softmax and the sum.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+#define QMAX 4
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n; uint K1; uint nq;
+    uint nbe1; uint nbe2;
+    uint nbc1;
+    uint nbq1;
+    uint nbd1; uint nbd2;
+    uint e_offset; uint c_offset; uint q_offset; uint d_offset;
+    float eps; float scale;
+};
+
+layout(binding = 0, std430) readonly buffer E { float data_e[]; };
+layout(binding = 1, std430) readonly buffer C { float data_c[]; };
+layout(binding = 2, std430) readonly buffer Q { float data_q[]; };
+layout(binding = 3, std430) writeonly buffer D { float data_d[]; };
+
+shared float partial[(BLOCK_SIZE / 16) * (QMAX + 1)]; // one row per subgroup (subgroup size >= 16)
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint k   = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const bool is_cur = k == K1;
+
+    float acc[QMAX];
+    [[unroll]] for (uint q = 0; q < QMAX; ++q) {
+        acc[q] = 0.0f;
+    }
+    float ss = 0.0f;
+    if (is_cur) {
+        const uint cb = c_offset + t*nbc1;
+        for (uint i = tid; i < n; i += BLOCK_SIZE) {
+            const float s = data_c[cb + i];
+            ss += s*s;
+            [[unroll]] for (uint q = 0; q < QMAX; ++q) {
+                if (q < nq) {
+                    acc[q] += s*data_q[q_offset + q*nbq1 + i];
+                }
+            }
+        }
+    } else {
+        const uint eb = e_offset + t*nbe2 + k*nbe1;
+        for (uint i = tid; i < n; i += BLOCK_SIZE) {
+            const float s = data_e[eb + i];
+            [[unroll]] for (uint q = 0; q < QMAX; ++q) {
+                if (q < nq) {
+                    acc[q] += s*data_q[q_offset + q*nbq1 + i];
+                }
+            }
+        }
+    }
+
+    ss = subgroupAdd(ss);
+    [[unroll]] for (uint q = 0; q < QMAX; ++q) {
+        acc[q] = subgroupAdd(acc[q]);
+    }
+    if (subgroupElect()) {
+        [[unroll]] for (uint q = 0; q < QMAX; ++q) {
+            partial[gl_SubgroupID*(QMAX + 1) + q] = acc[q];
+        }
+        partial[gl_SubgroupID*(QMAX + 1) + QMAX] = ss;
+    }
+    barrier();
+
+    if (tid < nq) {
+        float d = 0.0f, s2 = 0.0f;
+        for (uint g = 0; g < gl_NumSubgroups; ++g) {
+            d  += partial[g*(QMAX + 1) + tid];
+            s2 += partial[g*(QMAX + 1) + QMAX];
+        }
+        const float rs = is_cur ? inversesqrt(s2/float(n) + eps) : 1.0f;
+        const uint db = d_offset + t*nbd2 + tid*nbd1;
+        data_d[db + k] = d*rs*scale;
+        if (is_cur) {
+            data_d[db + K1 + 1] = rs;
+        }
+    }
+}

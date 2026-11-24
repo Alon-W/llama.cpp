@@ -1,0 +1,68 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// Apply a loop controller's gate (inkling2 control()), BLOCK_SIZE/LANES output elements of one token per workgroup:
+//   dst[e, t] = cur[e, t] - tanh(w_forget[:, e] . gate[:, t])*cur[e, t] + tanh(w_gain[:, e] . gate[:, t])*msg[e, t]
+// replaces MUL_MAT(gain), MUL_MAT(forget) and the LOOP_CTRL tail (TANH, TANH, MUL, SUB, MUL, ADD).
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+#define LANES 16
+#define RMAX 256
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n; uint r;
+    uint nbc1; uint nbm1; uint nbg1;   // cur, msg, gate row strides in elements
+    uint nbwg1; uint nbwf1;            // w_gain, w_forget row strides
+    uint nbd1;
+    uint c_offset; uint m_offset; uint g_offset; uint wg_offset; uint wf_offset; uint d_offset;
+};
+
+layout(binding = 0, std430) readonly buffer C  { float data_c[]; };
+layout(binding = 1, std430) readonly buffer M  { float data_m[]; };
+layout(binding = 2, std430) readonly buffer G  { float data_g[]; };
+layout(binding = 3, std430) readonly buffer WG { float data_wg[]; };
+layout(binding = 4, std430) readonly buffer WF { float data_wf[]; };
+layout(binding = 5, std430) writeonly buffer D { float data_d[]; };
+
+shared float gate[RMAX];
+shared float pg[BLOCK_SIZE];
+shared float pf[BLOCK_SIZE];
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint t    = gl_WorkGroupID.y;
+    const uint lane = tid % LANES;
+    const uint e    = gl_WorkGroupID.x * (BLOCK_SIZE/LANES) + tid/LANES;
+
+    for (uint j = tid; j < r; j += BLOCK_SIZE) {
+        gate[j] = data_g[g_offset + t*nbg1 + j];
+    }
+    barrier();
+
+    float dg = 0.0f, df = 0.0f;
+    if (e < n) {
+        const uint wgb = wg_offset + e*nbwg1;
+        const uint wfb = wf_offset + e*nbwf1;
+        for (uint j = lane; j < r; j += LANES) {
+            dg += data_wg[wgb + j]*gate[j];
+            df += data_wf[wfb + j]*gate[j];
+        }
+    }
+    pg[tid] = dg;
+    pf[tid] = df;
+    barrier();
+    if (lane == 0 && e < n) {
+        float g = 0.0f, f = 0.0f;
+        [[unroll]] for (uint k = 0; k < LANES; ++k) {
+            g += pg[tid + k];
+            f += pf[tid + k];
+        }
+        const float c = data_c[c_offset + t*nbc1 + e];
+        const float m = data_m[m_offset + t*nbm1 + e];
+        data_d[d_offset + t*nbd1 + e] = c - tanh(f)*c + tanh(g)*m;
+    }
+}

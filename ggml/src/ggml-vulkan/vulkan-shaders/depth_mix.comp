@@ -1,0 +1,147 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Attention over depth (inkling2 mix()), one workgroup per token:
+//   S = [earlier[:, 0..K1-1, t], rms_norm(cur[:, t])]
+//   dst[:, q, t] = sum_k softmax_k(scale * S_k . query_q) * S_k
+// replaces RMS_NORM, CONCAT, REPEAT, MUL_MAT, SOFT_MAX, CONT(TRANSPOSE), MUL_MAT.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+#define KMAX 16
+#define QMAX 4
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n; uint K1; uint nq;
+    uint nbe1; uint nbe2;   // earlier strides in elements
+    uint nbc1;              // cur row stride
+    uint nbq1;              // query row stride
+    uint nbd1; uint nbd2;   // dst strides
+    uint e_offset; uint c_offset; uint q_offset; uint d_offset;
+    float eps; float scale;
+};
+
+layout(binding = 0, std430) readonly buffer E { float data_e[]; };
+layout(binding = 1, std430) readonly buffer C { float data_c[]; };
+layout(binding = 2, std430) readonly buffer Q { float data_q[]; };
+layout(binding = 3, std430) writeonly buffer D { float data_d[]; };
+
+shared float partial[(BLOCK_SIZE / 16) * (KMAX*QMAX + 1)]; // one row per subgroup (subgroup size >= 16)
+shared float wsh[KMAX*QMAX];
+shared float rs_sh;
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint t   = gl_WorkGroupID.x;
+    const uint K   = K1 + 1;
+    const uint eb  = e_offset + t*nbe2;
+    const uint cb  = c_offset + t*nbc1;
+
+    // rms of cur
+    float s = 0.0f;
+    for (uint i = tid; i < n; i += BLOCK_SIZE) {
+        const float v = data_c[cb + i];
+        s += v*v;
+    }
+    s = subgroupAdd(s);
+    if (subgroupElect()) {
+        partial[gl_SubgroupID] = s;
+    }
+    barrier();
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (uint k = 0; k < gl_NumSubgroups; ++k) {
+            tot += partial[k];
+        }
+        rs_sh = inversesqrt(tot/float(n) + eps);
+    }
+    barrier();
+    const float rs = rs_sh;
+
+    // scores: dot of every state with every query
+    float acc[KMAX*QMAX];
+    [[unroll]] for (uint p = 0; p < KMAX*QMAX; ++p) {
+        acc[p] = 0.0f;
+    }
+    for (uint i = tid; i < n; i += BLOCK_SIZE) {
+        float qv[QMAX];
+        [[unroll]] for (uint q = 0; q < QMAX; ++q) {
+            qv[q] = q < nq ? data_q[q_offset + q*nbq1 + i] : 0.0f;
+        }
+        [[unroll]] for (uint k = 0; k < KMAX; ++k) {
+            if (k < K) {
+                const float sv = k < K1 ? data_e[eb + k*nbe1 + i] : data_c[cb + i]*rs;
+                [[unroll]] for (uint q = 0; q < QMAX; ++q) {
+                    acc[k*QMAX + q] += sv*qv[q];
+                }
+            }
+        }
+    }
+    [[unroll]] for (uint p = 0; p < KMAX*QMAX; ++p) {
+        if (p/QMAX < K) {
+            const float v = subgroupAdd(acc[p]);
+            if (subgroupElect()) {
+                partial[gl_SubgroupID*(KMAX*QMAX) + p] = v;
+            }
+        }
+    }
+    barrier();
+
+    // softmax over k, one thread per query
+    if (tid < nq) {
+        const uint q = tid;
+        float mx = -1e30f;
+        [[unroll]] for (uint k = 0; k < KMAX; ++k) {
+            if (k < K) {
+                float d = 0.0f;
+                for (uint g = 0; g < gl_NumSubgroups; ++g) {
+                    d += partial[g*(KMAX*QMAX) + k*QMAX + q];
+                }
+                d *= scale;
+                wsh[k*QMAX + q] = d;
+                mx = max(mx, d);
+            }
+        }
+        float sum = 0.0f;
+        [[unroll]] for (uint k = 0; k < KMAX; ++k) {
+            if (k < K) {
+                const float e = exp(wsh[k*QMAX + q] - mx);
+                wsh[k*QMAX + q] = e;
+                sum += e;
+            }
+        }
+        const float inv = 1.0f/sum;
+        [[unroll]] for (uint k = 0; k < KMAX; ++k) {
+            if (k < K) {
+                wsh[k*QMAX + q] *= inv;
+            }
+        }
+    }
+    barrier();
+
+    // weighted sum of the states
+    for (uint i = tid; i < n; i += BLOCK_SIZE) {
+        float o[QMAX];
+        [[unroll]] for (uint q = 0; q < QMAX; ++q) {
+            o[q] = 0.0f;
+        }
+        [[unroll]] for (uint k = 0; k < KMAX; ++k) {
+            if (k < K) {
+                const float sv = k < K1 ? data_e[eb + k*nbe1 + i] : data_c[cb + i]*rs;
+                [[unroll]] for (uint q = 0; q < QMAX; ++q) {
+                    o[q] += wsh[k*QMAX + q]*sv;
+                }
+            }
+        }
+        [[unroll]] for (uint q = 0; q < QMAX; ++q) {
+            if (q < nq) {
+                data_d[d_offset + t*nbd2 + q*nbd1 + i] = o[q];
+            }
+        }
+    }
+}

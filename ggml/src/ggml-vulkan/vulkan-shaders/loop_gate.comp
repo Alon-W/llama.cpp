@@ -1,0 +1,89 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Loop controller gate (inkling2 control()), ROWS output rows of one token per workgroup:
+//   dst[j, t] = w[:, j] . concat(rms_norm(cur[:, t]), rms_norm(msg[:, t]))
+// replaces RMS_NORM, RMS_NORM, CONCAT, MUL_MAT. One pass per workgroup: the norms are applied to the raw dots at the end.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+#define ROWS 1
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n; uint r;
+    uint nbc1; uint nbm1;   // cur, msg row strides in elements
+    uint nbw1;              // w row stride (>= 2n)
+    uint nbd1;
+    uint c_offset; uint m_offset; uint w_offset; uint d_offset;
+    float eps;
+};
+
+layout(binding = 0, std430) readonly buffer C { float data_c[]; };
+layout(binding = 1, std430) readonly buffer M { float data_m[]; };
+layout(binding = 2, std430) readonly buffer W { float data_w[]; };
+layout(binding = 3, std430) writeonly buffer D { float data_d[]; };
+
+shared float partial[(BLOCK_SIZE / 16) * (2*ROWS + 2)]; // one row per subgroup (subgroup size >= 16)
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint j0  = gl_WorkGroupID.x * ROWS;
+    const uint t   = gl_WorkGroupID.y;
+    const uint cb  = c_offset + t*nbc1;
+    const uint mb  = m_offset + t*nbm1;
+
+    // one pass: raw dots of the two halves of each w row with cur and msg, and both sums of squares;
+    // w . concat(c*rc, m*rm) = rc*(w_lo . c) + rm*(w_hi . m)
+    float sc = 0.0f, sm = 0.0f;
+    float ac[ROWS], am[ROWS];
+    [[unroll]] for (uint k = 0; k < ROWS; ++k) {
+        ac[k] = 0.0f;
+        am[k] = 0.0f;
+    }
+    for (uint i = tid; i < n; i += BLOCK_SIZE) {
+        const float c = data_c[cb + i];
+        const float m = data_m[mb + i];
+        sc += c*c;
+        sm += m*m;
+        [[unroll]] for (uint k = 0; k < ROWS; ++k) {
+            if (j0 + k < r) {
+                const uint wb = w_offset + (j0 + k)*nbw1;
+                ac[k] += data_w[wb + i]*c;
+                am[k] += data_w[wb + n + i]*m;
+            }
+        }
+    }
+    sc = subgroupAdd(sc);
+    sm = subgroupAdd(sm);
+    [[unroll]] for (uint k = 0; k < ROWS; ++k) {
+        ac[k] = subgroupAdd(ac[k]);
+        am[k] = subgroupAdd(am[k]);
+    }
+    const uint ps = 2*ROWS + 2;
+    if (subgroupElect()) {
+        [[unroll]] for (uint k = 0; k < ROWS; ++k) {
+            partial[gl_SubgroupID*ps + 2*k]     = ac[k];
+            partial[gl_SubgroupID*ps + 2*k + 1] = am[k];
+        }
+        partial[gl_SubgroupID*ps + 2*ROWS]     = sc;
+        partial[gl_SubgroupID*ps + 2*ROWS + 1] = sm;
+    }
+    barrier();
+    if (tid < ROWS && j0 + tid < r) {
+        float c = 0.0f, m = 0.0f, a = 0.0f, b = 0.0f;
+        for (uint g = 0; g < gl_NumSubgroups; ++g) {
+            c += partial[g*ps + 2*tid];
+            m += partial[g*ps + 2*tid + 1];
+            a += partial[g*ps + 2*ROWS];
+            b += partial[g*ps + 2*ROWS + 1];
+        }
+        const float rc = inversesqrt(a/float(n) + eps);
+        const float rm = inversesqrt(b/float(n) + eps);
+        data_d[d_offset + t*nbd1 + j0 + tid] = rc*c + rm*m;
+    }
+}

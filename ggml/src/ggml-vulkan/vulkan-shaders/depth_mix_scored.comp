@@ -1,0 +1,83 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// Attention over depth from precomputed scores (depth_scores.comp), BLOCK_SIZE output elements of one token per workgroup:
+//   w = softmax_k(scores[0..K1, q, t]),  dst[i, q, t] = sum_k w[k] * S_k[i],  S_K1 = cur * scores[K1 + 1, q, t]
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+#define KMAX 16
+#define QMAX 4
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n; uint K1; uint nq;
+    uint nbe1; uint nbe2;
+    uint nbc1;
+    uint nbs1; uint nbs2;
+    uint nbd1; uint nbd2;
+    uint e_offset; uint c_offset; uint s_offset; uint d_offset;
+};
+
+layout(binding = 0, std430) readonly buffer E { float data_e[]; };
+layout(binding = 1, std430) readonly buffer C { float data_c[]; };
+layout(binding = 2, std430) readonly buffer S { float data_s[]; };
+layout(binding = 3, std430) writeonly buffer D { float data_d[]; };
+
+shared float wsh[KMAX*QMAX];
+shared float rs_sh;
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint K   = K1 + 1;
+
+    if (tid < nq) {
+        const uint q  = tid;
+        const uint sb = s_offset + t*nbs2 + q*nbs1;
+        float mx = -1e30f;
+        for (uint k = 0; k < K; ++k) {
+            mx = max(mx, data_s[sb + k]);
+        }
+        float sum = 0.0f;
+        for (uint k = 0; k < K; ++k) {
+            const float e = exp(data_s[sb + k] - mx);
+            wsh[k*QMAX + q] = e;
+            sum += e;
+        }
+        const float inv = 1.0f/sum;
+        for (uint k = 0; k < K; ++k) {
+            wsh[k*QMAX + q] *= inv;
+        }
+        if (q == 0) {
+            rs_sh = data_s[sb + K1 + 1];
+        }
+    }
+    barrier();
+
+    const uint i = gl_WorkGroupID.x*BLOCK_SIZE + tid;
+    if (i >= n) {
+        return;
+    }
+    const float rs = rs_sh;
+    float o[QMAX];
+    [[unroll]] for (uint q = 0; q < QMAX; ++q) {
+        o[q] = 0.0f;
+    }
+    const uint eb = e_offset + t*nbe2 + i;
+    for (uint k = 0; k < K1; ++k) {
+        const float sv = data_e[eb + k*nbe1];
+        [[unroll]] for (uint q = 0; q < QMAX; ++q) {
+            o[q] += wsh[k*QMAX + q]*sv;
+        }
+    }
+    const float sc = data_c[c_offset + t*nbc1 + i]*rs;
+    [[unroll]] for (uint q = 0; q < QMAX; ++q) {
+        o[q] += wsh[K1*QMAX + q]*sc;
+        if (q < nq) {
+            data_d[d_offset + t*nbd2 + q*nbd1 + i] = o[q];
+        }
+    }
+}
