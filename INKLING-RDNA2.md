@@ -56,6 +56,34 @@ Speculative decoding keeps the target model's sampling distribution.
   ring buffer of RNN features (`--spec-type draft-dflash`).
 - `tools/inkling-dspark-convert`: converts the official `mtp.safetensors` and `config.json` to a drafter GGUF.
 
+## Prompt cache across model swaps (`--slot-persist`)
+
+With one model in VRAM at a time, every router swap used to throw away the model's prompt cache. The next
+request then re-processed the whole agent context (system prompt, tools, history: ~13-16K tokens for opencode).
+
+`--slot-persist` (with `--slot-save-path`) saves each slot when the server exits and restores it at the next load.
+In a router preset:
+
+```ini
+[*]
+slot-save-path = /slots/
+slot-persist = true
+```
+
+| Switch back to a model, ~15K-token agent context | Before | After |
+|---|---|---|
+| Qwen3.8 27B | 70-76 s | 4.4-5.4 s |
+| Inkling 2 Mini (code entry, DSpark) | 27.6 s | 5.7 s |
+
+The remaining time is the model load. Save takes 0.2-1.2 s, restore 0.2-0.4 s; files are 0.6-1.3 GB per slot.
+Files are named by alias, model file and context size, so a changed entry never restores stale state.
+
+**Which context is kept:** on exit, a slot takes the longest context from the RAM prompt cache. A prompt under
+1,024 tokens never replaces a saved file.
+
+**Known limit:** only one context per slot is saved. A brand-new session right after a swap benefits only if that
+context shares its system prompt. Continuing a conversation always does.
+
 ## Build
 
 The same as upstream Vulkan builds:
